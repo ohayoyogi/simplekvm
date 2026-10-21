@@ -1,0 +1,23 @@
+// Tinker Board (RK3288): let software pick the OTG port role.
+//
+// With "usb-role-switch", dwc2 overrides the ID / VBUS / A- and B-valid
+// signals, so the micro-USB port can be forced into device (gadget) mode
+// with  echo device > /sys/class/usb_role/ff580000.usb-role-switch/role
+// even if the ID pin is floating or VBUS is cut.
+//
+// Install: sudo armbian-add-overlay tinker-otg-role-switch.dts  (then reboot)
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "rockchip,rk3288";
+
+	fragment@0 {
+		target = <&usb_otg>;
+		__overlay__ {
+			dr_mode = "otg";
+			usb-role-switch;
+			role-switch-default-mode = "peripheral";
+		};
+	};
+};

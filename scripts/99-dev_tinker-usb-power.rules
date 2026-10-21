@@ -1,0 +1,11 @@
+# Keep the UVC capture stick and Tinker Board's onboard USB hub out of
+# runtime autosuspend. On RK3288 (dwc2) the Genesys hub fails to resume:
+# every open of the capture device reset the whole hub and re-enumerated it.
+#
+# Install: sudo cp 99-dev_tinker-usb-power.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger -s usb
+
+# Actions Micro "Display capture-UVC05"
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{idVendor}=="1de1", ATTR{idProduct}=="f115", TEST=="power/control", ATTR{power/control}="on"
+# Genesys Logic GL850G hub on the Tinker Board
+ACTION=="add|bind", SUBSYSTEM=="usb", ATTR{idVendor}=="05e3", ATTR{idProduct}=="0610", TEST=="power/control", ATTR{power/control}="on"
