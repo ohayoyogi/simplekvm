@@ -3,7 +3,7 @@
 # keyboard (/dev/hidg0) + absolute mouse (/dev/hidg1, 0..32767).
 # Run as root:  sudo ./tinker-hid-gadget.sh [up|down]
 #
-# Report formats (same as the RP2350 UART protocol in NOTES.md):
+# Report formats (same as the RP2350 firmware, firmware/kvm-hid/src/hid_reports.h):
 #   hidg0: 8 bytes  <mod> 0 <k1> <k2> <k3> <k4> <k5> <k6>
 #   hidg1: 6 bytes  <buttons> <x lo> <x hi> <y lo> <y hi> <wheel(int8)>
 set -euo pipefail

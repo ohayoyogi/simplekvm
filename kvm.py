@@ -19,8 +19,8 @@ and its latency measured.
 --source auto uses a UVC capture stick when one is plugged in (MJPEG ->
 jpegdec -> VPU), then a CSI-2 source on the RK3288 ISP (OV5647 camera or
 TC358743 / C790 HDMI bridge: NV12 from the ISP -> VPU, no CPU decode; needs
-patches/camera/ and patches/gstreamer/0002), otherwise the built-in test
-screen. --fb-echo draws
+the kernel and GStreamer patches of the rk3288-mainline-media repository),
+otherwise the built-in test screen. --fb-echo draws
 browser clicks on the board's own HDMI output for loopback latency tests.
 
 Open https://<board>:8443/ in Chrome/Edge (accept the self-signed
@@ -40,6 +40,7 @@ import json
 import os
 import queue
 import re
+import signal
 import socket
 import socketserver
 import ssl
@@ -557,7 +558,8 @@ class HidSerial:
 
 # --------------------------------------------------------------------------
 # CSI-2 input: RK3288 ISP (rkisp1) with an OV5647 camera or a TC358743
-# HDMI bridge (C790). Needs the patches/overlays in patches/camera/.
+# HDMI bridge (C790). Needs the kernel patches and DT overlays from the
+# rk3288-mainline-media repository (patches/camera/).
 # --------------------------------------------------------------------------
 
 class Csi:
@@ -714,7 +716,8 @@ class Encoder:
             # rkisp1 main path: NV12 straight from the ISP. drop-allocation
             # keeps v4l2src on its own buffers (importing the encoder's
             # macroblock-padded pool is rejected with EINVAL); the encoder
-            # then copies the visible area (patches/gstreamer/0002).
+            # then copies the visible area (rk3288-mainline-media:
+            # patches/gstreamer/0002).
             # io-mode=mmap: with the default (auto) v4l2src hands out stale
             # buffers, the same 4 frames over and over while the ISP runs.
             src = ["v4l2src", "device=%s" % self.csi.video, "io-mode=mmap",
@@ -850,8 +853,12 @@ class Encoder:
 
     def stop(self):
         self.stopping = True
-        if self.proc:
+        if self.proc and self.proc.poll() is None:
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
     # RTP (RFC 6184) depacketizer: single NAL, STAP-A, FU-A. The marker bit
     # ends an access unit, so each frame is forwarded as soon as it is done.
@@ -1600,8 +1607,9 @@ def main():
     p.add_argument("--csi-media", default="auto",
                    help="media device of the rkisp1 ISP (default: the one with rkisp1_mainpath)")
     p.add_argument("--csi-edid", default="",
-                   help="TC358743 EDID file (default: patches/camera/edid-tc358743.txt next "
-                        "to kvm.py, or ~/camera/edid-tc358743.txt)")
+                   help="TC358743 EDID file (default: ~/camera/edid-tc358743.txt, or "
+                        "patches/camera/edid-tc358743.txt of an rk3288-mainline-media "
+                        "checkout next to this repository)")
     p.add_argument("--capture-fps", type=int, default=60,
                    help="frame rate requested from the capture stick")
     p.add_argument("--fb-echo", default="", metavar="FB",
@@ -1639,11 +1647,13 @@ def main():
     csi = None
     if args.source == "csi":
         if not args.csi_media:
-            p.error("no rkisp1 media device (camera overlay active? see scripts/tinker-camera.sh)")
+            p.error("no rkisp1 media device (camera overlay active? see "
+                    "scripts/tinker-camera.sh in rk3288-mainline-media)")
         if not args.csi_edid:
             here = os.path.dirname(os.path.abspath(__file__))
-            for f in (os.path.join(here, "patches", "camera", "edid-tc358743.txt"),
-                      os.path.expanduser("~/camera/edid-tc358743.txt")):
+            for f in (os.path.expanduser("~/camera/edid-tc358743.txt"),
+                      os.path.join(here, "..", "rk3288-mainline-media", "patches", "camera",
+                                   "edid-tc358743.txt")):
                 if os.path.exists(f):
                     args.csi_edid = f
                     break
@@ -1684,6 +1694,9 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     for a in [socket.gethostname()] + local_addresses():
         log("%s://%s:%d/" % (scheme, a, args.port))
+    def on_term(signum, frame):
+        raise KeyboardInterrupt      # kill / systemd stop: take GStreamer down too
+    signal.signal(signal.SIGTERM, on_term)
     try:
         kvm.run()
     except KeyboardInterrupt:
