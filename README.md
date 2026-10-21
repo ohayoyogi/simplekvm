@@ -34,7 +34,7 @@ until the pixel changes in the browser.
 
 The H.264 encoder and the CSI-2 capture need kernel and GStreamer patches
 that mainline does not have yet. They live in a separate repository,
-**rk3288-mainline-media** (to be published): Hantro H1 stateless H.264
+**[rk3288-mainline-media](https://github.com/ohayoyogi/rk3288-mainline-media)**: Hantro H1 stateless H.264
 encoder, rkisp1 / MIPI DPHY support for RK3288, TC358743 fixes, device tree
 overlays and EDIDs.
 
