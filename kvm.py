@@ -34,12 +34,14 @@ source, and ScreenInput for a HID sink (RP2350 over UART or a USB gadget).
 import argparse
 import base64
 import collections
+import errno
 import hashlib
 import http.server
 import json
 import os
 import queue
 import re
+import select
 import signal
 import socket
 import socketserver
@@ -270,7 +272,8 @@ class FbEcho:
 
 
 # --------------------------------------------------------------------------
-# HID output: line protocol to the RP2350 (UART or USB CDC, both are a tty)
+# HID output: line protocol to the RP2350 (UART or USB CDC, both are a tty),
+# or the same reports written straight to /dev/hidg* (USB gadget, HidGadget)
 # --------------------------------------------------------------------------
 #
 #   K mm k1 k2 k3 k4 k5 k6   keyboard report (hex): modifiers + 6 usage codes
@@ -348,17 +351,18 @@ def char_to_key(ch, layout):
     return None, False
 
 
-class HidSerial:
-    """Keeps keyboard/mouse state and sends reports to the RP2350 over a tty
-    (/dev/ttyS* for the UART firmware, /dev/ttyACM* for the CDC firmware).
-    Reopens the port if it goes away (CDC unplug)."""
+def is_hidg(path):
+    return os.path.basename(path or "").startswith("hidg")
 
-    BAUDS = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
-             1000000, 1500000, 2000000}
 
-    def __init__(self, path, baud, on_status):
-        self.path, self.baud, self.on_status = path, baud, on_status
-        self.fd = None
+class Hid:
+    """Keyboard/mouse state shared by the HID sinks. Subclasses send the
+    reports (_ensure, _report_key/_abs/_rel/_release) and read the LEDs
+    (_reader)."""
+
+    def __init__(self, path, on_status):
+        self.path, self.on_status = path, on_status
+        self.fd = None                 # set while the sink is usable
         self.lock = threading.Lock()
         self.keys = []                 # pressed non-modifier usages, in order
         self.mods = 0
@@ -370,6 +374,124 @@ class HidSerial:
         self.wake = threading.Event()
         threading.Thread(target=self._writer, daemon=True).start()
         threading.Thread(target=self._reader, daemon=True).start()
+
+    def status(self):
+        return {"path": self.path, "open": self.fd is not None,
+                "version": self.version, "leds": self.leds}
+
+    def status_changed(self):
+        try:
+            self.on_status(self.status())
+        except Exception:
+            pass
+
+    def _set_leds(self, leds):
+        if leds != self.leds:
+            self.leds = leds
+            self.status_changed()
+
+    # -- reports ----------------------------------------------------------------
+    def _key_report(self):
+        self._report_key(self.mods, (self.keys + [0] * 6)[:6])
+
+    def key(self, code, down):
+        if code in HID_MODS:
+            bit = HID_MODS[code]
+            self.mods = (self.mods | bit) if down else (self.mods & ~bit)
+        elif code in HID_KEYS:
+            u = HID_KEYS[code]
+            if down and u not in self.keys:
+                self.keys.append(u)
+            elif not down and u in self.keys:
+                self.keys.remove(u)
+        else:
+            return
+        self._key_report()
+
+    def release_all(self):
+        self.keys, self.mods, self.buttons = [], 0, 0
+        self._report_release()
+
+    def combo(self, codes, hold=0.05):
+        """Press keys in order, then release in reverse (Ctrl+Alt+Del etc.)."""
+        for c in codes:
+            self.key(c, True)
+            time.sleep(0.01)
+        time.sleep(hold)
+        for c in reversed(codes):
+            self.key(c, False)
+            time.sleep(0.01)
+
+    def type_text(self, text, layout="us", delay=0.012):
+        for ch in text:
+            code, shift = char_to_key(ch, layout)
+            if code is None:
+                continue
+            if shift:
+                self.key("ShiftLeft", True)
+            self.key(code, True)
+            time.sleep(delay)
+            self.key(code, False)
+            if shift:
+                self.key("ShiftLeft", False)
+            time.sleep(delay)
+
+    def mouse_abs(self, x, y, buttons=None, wheel=0):
+        """x, y in 0..1. Moves are coalesced (<= ~125 Hz); buttons and wheel
+        go out at once with the latest position."""
+        nx = max(0, min(0x7FFF, int(x * 0x7FFF)))
+        ny = max(0, min(0x7FFF, int(y * 0x7FFF)))
+        if buttons is None and not wheel:
+            self.abs = (nx, ny)
+            self.wake.set()
+            return
+        if buttons is not None:
+            self.buttons = buttons & 0x1F
+        self.abs = None
+        self.last_abs_sent = time.monotonic()
+        self._report_abs(self.buttons, nx, ny, wheel)
+
+    def mouse_rel(self, dx, dy, buttons=None, wheel=0):
+        if buttons is not None:
+            self.buttons = buttons & 0x1F
+        while dx or dy or wheel is not None:
+            sx = max(-127, min(127, dx))
+            sy = max(-127, min(127, dy))
+            self._report_rel(self.buttons, sx, sy, wheel or 0)
+            dx, dy, wheel = dx - sx, dy - sy, None
+            if not dx and not dy:
+                break
+
+    def _writer(self):
+        while True:
+            self.wake.wait(1.0)
+            self.wake.clear()
+            if self.fd is None:
+                with self.lock:
+                    self._ensure()
+            pos = self.abs
+            if pos is None:
+                continue
+            wait = 0.008 - (time.monotonic() - self.last_abs_sent)
+            if wait > 0:
+                time.sleep(wait)
+            pos, self.abs = self.abs, None
+            if pos is not None:
+                self.last_abs_sent = time.monotonic()
+                self._report_abs(self.buttons, pos[0], pos[1], 0)
+
+
+class HidSerial(Hid):
+    """Sends reports to the RP2350 over a tty (/dev/ttyS* for the UART
+    firmware, /dev/ttyACM* for the CDC firmware). Reopens the port if it goes
+    away (CDC unplug)."""
+
+    BAUDS = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
+             1000000, 1500000, 2000000}
+
+    def __init__(self, path, baud, on_status):
+        self.baud = baud
+        super().__init__(path, on_status)
 
     # -- port -------------------------------------------------------------------
     def _open(self):
@@ -416,112 +538,22 @@ class HidSerial:
             self._drop(e)
             return False
 
-    def status(self):
-        return {"path": self.path, "open": self.fd is not None,
-                "version": self.version, "leds": self.leds}
-
-    def status_changed(self):
-        try:
-            self.on_status(self.status())
-        except Exception:
-            pass
-
-    # -- reports ----------------------------------------------------------------
     def _send(self, line):
         with self.lock:
             if self._ensure():
                 self._send_raw(line.encode() + b"\n")
 
-    def _key_report(self):
-        k = (self.keys + [0] * 6)[:6]
-        self._send("K %02x %s" % (self.mods, " ".join("%02x" % c for c in k)))
+    def _report_key(self, mods, keys):
+        self._send("K %02x %s" % (mods, " ".join("%02x" % c for c in keys)))
 
-    def key(self, code, down):
-        if code in HID_MODS:
-            bit = HID_MODS[code]
-            self.mods = (self.mods | bit) if down else (self.mods & ~bit)
-        elif code in HID_KEYS:
-            u = HID_KEYS[code]
-            if down and u not in self.keys:
-                self.keys.append(u)
-            elif not down and u in self.keys:
-                self.keys.remove(u)
-        else:
-            return
-        self._key_report()
+    def _report_abs(self, buttons, x, y, wheel):
+        self._send("A %02x %04x %04x %02x" % (buttons, x, y, wheel & 0xFF))
 
-    def release_all(self):
-        self.keys, self.mods, self.buttons = [], 0, 0
+    def _report_rel(self, buttons, dx, dy, wheel):
+        self._send("R %02x %02x %02x %02x" % (buttons, dx & 0xFF, dy & 0xFF, wheel & 0xFF))
+
+    def _report_release(self):
         self._send("Z")
-
-    def combo(self, codes, hold=0.05):
-        """Press keys in order, then release in reverse (Ctrl+Alt+Del etc.)."""
-        for c in codes:
-            self.key(c, True)
-            time.sleep(0.01)
-        time.sleep(hold)
-        for c in reversed(codes):
-            self.key(c, False)
-            time.sleep(0.01)
-
-    def type_text(self, text, layout="us", delay=0.012):
-        for ch in text:
-            code, shift = char_to_key(ch, layout)
-            if code is None:
-                continue
-            if shift:
-                self.key("ShiftLeft", True)
-            self.key(code, True)
-            time.sleep(delay)
-            self.key(code, False)
-            if shift:
-                self.key("ShiftLeft", False)
-            time.sleep(delay)
-
-    def mouse_abs(self, x, y, buttons=None, wheel=0):
-        """x, y in 0..1. Moves are coalesced (<= ~125 Hz); buttons and wheel
-        go out at once with the latest position."""
-        nx = max(0, min(0x7FFF, int(x * 0x7FFF)))
-        ny = max(0, min(0x7FFF, int(y * 0x7FFF)))
-        if buttons is None and not wheel:
-            self.abs = (nx, ny)
-            self.wake.set()
-            return
-        if buttons is not None:
-            self.buttons = buttons & 0x1F
-        self.abs = None
-        self.last_abs_sent = time.monotonic()
-        self._send("A %02x %04x %04x %02x" % (self.buttons, nx, ny, wheel & 0xFF))
-
-    def mouse_rel(self, dx, dy, buttons=None, wheel=0):
-        if buttons is not None:
-            self.buttons = buttons & 0x1F
-        while dx or dy or wheel is not None:
-            sx = max(-127, min(127, dx))
-            sy = max(-127, min(127, dy))
-            self._send("R %02x %02x %02x %02x" % (self.buttons, sx & 0xFF, sy & 0xFF,
-                                                  (wheel or 0) & 0xFF))
-            dx, dy, wheel = dx - sx, dy - sy, None
-            if not dx and not dy:
-                break
-
-    def _writer(self):
-        while True:
-            self.wake.wait(1.0)
-            self.wake.clear()
-            if self.fd is None:
-                with self.lock:
-                    self._ensure()
-            pos = self.abs
-            if pos is None:
-                continue
-            wait = 0.008 - (time.monotonic() - self.last_abs_sent)
-            if wait > 0:
-                time.sleep(wait)
-            pos, self.abs = self.abs, None
-            if pos is not None:
-                self.last_abs_sent = time.monotonic()
-                self._send("A %02x %04x %04x 00" % (self.buttons, pos[0], pos[1]))
 
     def _reader(self):
         buf = b""
@@ -550,10 +582,119 @@ class HidSerial:
                     self.status_changed()
                 elif line.startswith("L ") and len(line) >= 4:
                     try:
-                        self.leds = int(line[2:4], 16)
+                        self._set_leds(int(line[2:4], 16))
                     except ValueError:
                         continue
-                    self.status_changed()
+
+
+class HidGadget(Hid):
+    """Sends reports straight to the host as a USB HID gadget on this board's
+    OTG port (scripts/tinker-hid-gadget.sh): /dev/hidgN = keyboard, N+1 =
+    absolute mouse, N+2 = relative (boot) mouse. Reads the keyboard LEDs
+    back from /dev/hidgN."""
+
+    WRITE_WAIT = 0.1    # f_hid holds one report; wait this long for the host to take it
+
+    def __init__(self, path, on_status):
+        base = path.rstrip("0123456789")
+        n = int(path[len(base):] or 0)
+        self.paths = ["%s%d" % (base, n + i) for i in range(3)]   # kbd, abs, rel
+        self.fds = None
+        self.last_xy = None            # absolute position, to release buttons in place
+        self.shutdown_logged = False
+        super().__init__(path, on_status)
+
+    def _ensure(self):
+        if self.fd is not None:
+            return True
+        fds = []
+        try:
+            for p in self.paths:
+                fds.append(os.open(p, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            for fd in fds:
+                os.close(fd)
+            return False
+        self.fds, self.fd = fds, fds[0]
+        self.version = "USB gadget"
+        log("hid: opened", " ".join(self.paths))
+        self.status_changed()
+        return True
+
+    def _drop(self, why):
+        if self.fd is not None:
+            log("hid: %s closed (%s)" % (self.path, why))
+            for fd in self.fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fds, self.fd, self.version = None, None, None
+        self.status_changed()
+
+    def _write(self, i, report):
+        """Non-blocking write that waits up to WRITE_WAIT for the previous
+        report to go out: a blocking write would hang forever while the host
+        is off or suspended."""
+        with self.lock:
+            if not self._ensure():
+                return
+            fd = self.fds[i]
+            deadline = time.monotonic() + self.WRITE_WAIT
+            while True:
+                try:
+                    os.write(fd, report)
+                    self.shutdown_logged = False
+                    return
+                except BlockingIOError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return               # host is not polling; drop it
+                    select.select([], [fd], [], left)
+                except OSError as e:
+                    if e.errno == errno.ESHUTDOWN:   # not connected to a host
+                        if not self.shutdown_logged:
+                            log("hid: gadget not connected to a host")
+                            self.shutdown_logged = True
+                        return
+                    self._drop(e)
+                    return
+
+    def _report_key(self, mods, keys):
+        self._write(0, bytes([mods, 0] + keys))
+
+    def _report_abs(self, buttons, x, y, wheel):
+        self.last_xy = (x, y)
+        self._write(1, struct.pack("<BHHb", buttons, x, y, max(-127, min(127, wheel))))
+
+    def _report_rel(self, buttons, dx, dy, wheel):
+        self._write(2, struct.pack("<Bbbbb", buttons, dx, dy, max(-127, min(127, wheel)), 0))
+
+    def _report_release(self):
+        self._report_key(0, [0] * 6)
+        if self.last_xy is not None:
+            self._report_abs(0, self.last_xy[0], self.last_xy[1], 0)
+        self._report_rel(0, 0, 0, 0)
+
+    def _reader(self):
+        # Output reports (keyboard LEDs) arrive on reads of the keyboard device.
+        while True:
+            try:
+                fd = os.open(self.paths[0], os.O_RDONLY)
+            except OSError:
+                time.sleep(1.0)
+                continue
+            try:
+                while True:
+                    data = os.read(fd, 8)
+                    if data:
+                        self._set_leds(data[0])
+                    else:
+                        time.sleep(0.05)
+            except OSError:
+                time.sleep(0.5)
+            finally:
+                os.close(fd)
 
 
 # --------------------------------------------------------------------------
@@ -982,7 +1123,11 @@ class KVM:
             self.fb = FbEcho(args.fb_echo, args.width, args.height)
         self.clients = set()
         self.clients_lock = threading.Lock()
-        self.hid = HidSerial(args.hid, args.hid_baud, self.on_hid_status) if args.hid else None
+        self.hid = None
+        if is_hidg(args.hid):
+            self.hid = HidGadget(args.hid, self.on_hid_status)
+        elif args.hid:
+            self.hid = HidSerial(args.hid, args.hid_baud, self.on_hid_status)
         self.inputs = queue.Queue()
         self.applied_seq = 0
         self.meta = {}                     # frame_no -> applied input seq
@@ -1379,12 +1524,22 @@ cv.addEventListener('contextmenu', e => e.preventDefault());
 // fullscreen; Ctrl+Alt+Del never reaches a page -> use the special-key menu.
 cv.tabIndex = 0;
 const held = new Set();
+// Some Windows keyboards/drivers send a modifier without a scan code (seen
+// with the right Shift): code is "" and location 0. Fall back to keyCode;
+// the side is unknown then, so it becomes the left one.
+const MOD_KEYCODES = { 16: 'Shift', 17: 'Control', 18: 'Alt', 91: 'Meta' };
+function keyCodeOf(e) {
+  if (e.code) return e.code;
+  const m = MOD_KEYCODES[e.keyCode];
+  return m ? m + (e.location === 2 ? 'Right' : 'Left') : '';
+}
 function onKey(e, isDown) {
-  if (document.activeElement !== cv || !e.code) return;
+  const code = keyCodeOf(e);
+  if (document.activeElement !== cv || !code) return;
   e.preventDefault(); e.stopPropagation();
   if (isDown && e.repeat) return;        // the target generates its own repeat
-  if (isDown) held.add(e.code); else held.delete(e.code);
-  wsSend({ t: 'key', code: e.code, down: isDown });
+  if (isDown) held.add(code); else held.delete(code);
+  wsSend({ t: 'key', code: code, down: isDown });
   $('keys').textContent = held.size ? [...held].join('+') : '-';
 }
 document.addEventListener('keydown', e => onKey(e, true), true);
@@ -1614,9 +1769,12 @@ def main():
                    help="frame rate requested from the capture stick")
     p.add_argument("--fb-echo", default="", metavar="FB",
                    help="loopback test: draw clicks on this framebuffer (e.g. /dev/fb0)")
-    p.add_argument("--hid", default="auto", metavar="TTY",
-                   help="RP2350 HID bridge: /dev/ttyS* (UART firmware), /dev/ttyACM* "
-                        "(CDC firmware), auto = the CDC firmware if plugged in, none = off")
+    p.add_argument("--hid", default="auto", metavar="DEV",
+                   help="keyboard/mouse output: /dev/ttyS* (RP2350 UART firmware), "
+                        "/dev/ttyACM* (RP2350 CDC firmware), gadget = this board as a USB "
+                        "HID gadget (/dev/hidg0..2, scripts/tinker-hid-gadget.sh), "
+                        "auto = the CDC firmware if plugged in, else the gadget if set up, "
+                        "none = off")
     p.add_argument("--hid-baud", type=int, default=115200, help="UART baud rate")
     p.add_argument("--width", type=int, default=0,
                    help="video size (default: 1920x1080 for capture = dot-by-dot "
@@ -1668,10 +1826,12 @@ def main():
         byid = "/dev/serial/by-id"
         cands = sorted(os.listdir(byid)) if os.path.isdir(byid) else []
         cands = [os.path.join(byid, c) for c in cands if "kvm-hid" in c]
-        args.hid = cands[0] if cands else ""
+        args.hid = cands[0] if cands else "/dev/hidg0" if os.path.exists("/dev/hidg0") else ""
+    elif args.hid == "gadget":
+        args.hid = "/dev/hidg0"
     elif args.hid == "none":
         args.hid = ""
-    if args.hid and args.hid_baud not in HidSerial.BAUDS:
+    if args.hid and not is_hidg(args.hid) and args.hid_baud not in HidSerial.BAUDS:
         p.error("unsupported --hid-baud")
     if not args.width or not args.height:
         args.width, args.height = (1920, 1080) if args.source == "capture" else (1280, 720)

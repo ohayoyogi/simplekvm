@@ -6,7 +6,7 @@ ordinary Linux single-board computer instead of replacing its OS.
 ```
 browser ──HTTPS / WebSocket── SBC running kvm.py ──┬─ HDMI capture (UVC stick, or CSI-2 bridge) ── HDMI ── target PC
   (WebCodecs H.264 decode,                         └─ RP2350 HID bridge (UART or USB CDC) ── USB ──── target PC
-   keyboard / mouse capture)
+   keyboard / mouse capture)                          or the board's own OTG port as a USB HID gadget
 ```
 
 - **One Python file, standard library only** (`kvm.py`). Video encoding is
@@ -14,7 +14,8 @@ browser ──HTTPS / WebSocket── SBC running kvm.py ──┬─ HDMI captu
 - **H.264 over WebSocket, decoded in the browser with WebCodecs**: no
   WebRTC server, no MJPEG bandwidth.
 - **Keyboard and mouse through a small RP2350 board** acting as a USB HID
-  device (boot keyboard, absolute and relative mouse) for the target PC.
+  device (boot keyboard, absolute and relative mouse) for the target PC,
+  or through the board itself as a USB HID gadget (same reports).
 
 Status: **working prototype**, developed and tested on one ASUS Tinker
 Board (RK3288) running Armbian. Expect rough edges.
@@ -48,7 +49,8 @@ overlays and EDIDs.
 - A browser with WebCodecs: Chrome or Edge. WebCodecs needs a secure
   context, so kvm.py serves HTTPS with a self-signed certificate.
 - For keyboard and mouse: a Waveshare RP2350-USB-A with the firmware in
-  [`firmware/kvm-hid`](firmware/kvm-hid/README.md).
+  [`firmware/kvm-hid`](firmware/kvm-hid/README.md), or a USB OTG port on
+  the board (see "USB HID gadget" below).
 
 ## Quick start
 
@@ -56,6 +58,7 @@ overlays and EDIDs.
 python3 kvm.py                       # picks a UVC stick, then CSI, else the test screen
 python3 kvm.py --source csi --fps 60 # TC358743 / C790 on the RK3288 ISP
 python3 kvm.py --hid /dev/ttyS1      # RP2350 UART firmware on the 40-pin header
+python3 kvm.py --hid gadget          # the board itself as a USB HID gadget
 ```
 
 Open `https://<board>:8443/` and accept the self-signed certificate once
@@ -69,7 +72,7 @@ Useful options (`python3 kvm.py --help` for all):
 | `--source auto\|capture\|csi\|screen` | video source |
 | `--width/--height` | output size (CSI: scaled by the ISP) |
 | `--fps`, `--qp`, `--bitrate`, `--keyint` | encoder settings |
-| `--hid auto\|none\|TTY` | RP2350 bridge (`auto` finds the CDC firmware) |
+| `--hid auto\|gadget\|none\|TTY` | RP2350 bridge or USB gadget (`auto`: the CDC firmware, else the gadget if set up) |
 | `--csi-edid FILE` | EDID for the TC358743 (e.g. one that offers 1080p50) |
 | `--fb-echo /dev/fb0` | loopback latency test: draw browser clicks on the board's screen |
 | `--idle-stop SEC` | stop capture/encoding when nobody watches (`-1` = never) |
@@ -89,6 +92,28 @@ Useful options (`python3 kvm.py --help` for all):
 
 The page's labels are in Japanese for now.
 
+## USB HID gadget (Tinker Board)
+
+Instead of the RP2350, the board's micro-USB OTG port can be the keyboard
+and mouse itself: `sudo scripts/tinker-hid-gadget.sh` creates a boot
+keyboard (`/dev/hidg0`, LEDs readable), an absolute mouse (`/dev/hidg1`)
+and a relative boot mouse (`/dev/hidg2`) with configfs, then
+`kvm.py --hid gadget` writes to them. The stock Armbian kernel config
+already has everything (`USB_DWC2_DUAL_ROLE`, `USB_CONFIGFS_F_HID`); no
+device-tree overlay was needed.
+
+- On the Tinker Board the micro-USB data lines go through a BQ24392
+  charger-detect switch that only connects while VBUS is present. **Do not
+  use a VBUS-cutting cable ("USB power blocker")**: use a normal cable to
+  the target PC and power the board from the 5V pins of the 40-pin header
+  (a solid 5 V / 3 A supply; a weak one ends in a reset loop). The board's
+  power switch (NX5P3090) blocks current flowing back into the PC.
+- Tested in loopback (micro-USB into the board's own USB-A port): keys,
+  absolute and relative mouse and the keyboard LEDs all work. Not yet tried
+  on a separate PC (BIOS, target reboot, suspend).
+- The keyboard disappears from the target while the board reboots; the
+  RP2350 stays powered by the target and does not.
+
 ## Repository layout
 
 | Path | Contents |
@@ -96,7 +121,8 @@ The page's labels are in Japanese for now.
 | `kvm.py` | the whole server: capture/encoder control, HTTPS + WebSocket, the page, HID |
 | `firmware/kvm-hid/` | RP2350-USB-A HID firmware, UART and USB CDC variants (README in Japanese) |
 | `scripts/ws-probe.py` | headless viewer for tests (fps, first-frame time, saves the H.264) |
-| `scripts/tinker-hid-gadget.sh`, `scripts/tinker-otg-role-switch.dts` | experiment: the board itself as a USB HID gadget (untested) |
+| `scripts/tinker-hid-gadget.sh` | the board itself as a USB HID gadget (see above) |
+| `scripts/tinker-otg-role-switch.dts` | overlay to force the OTG port's role by software (not needed so far, untested) |
 | `scripts/99-dev_tinker-usb-power.rules` | keeps UVC capture sticks from autosuspending |
 | `scripts/serial.ps1`, `scripts/send-file.ps1` | Windows helpers for the board's serial console |
 
