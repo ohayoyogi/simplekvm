@@ -103,6 +103,49 @@ static void core1_main(void) {
 static uint8_t ep_buf[PIO_ITF_COUNT][8];
 static bool mouse_rel_turn;   // both pointer queues pending: alternate
 
+// Keepalive: while idle, send the current state again every KEEPALIVE_MS.
+// Linux's usbhid leaves its retry state only on a report with data; an idle
+// keyboard only NAKs, so two rare bus errors 1.0-1.5 s apart (with nothing
+// in between) made it reset the device (hid_io_error). A repeated state
+// report changes nothing on the target and clears that state; it also puts
+// the state back right after a reset.
+#define KEEPALIVE_MS 250
+static uint8_t idle_rep[PIO_ITF_COUNT][8];   // last report, motion/wheel zeroed
+static uint8_t idle_len[PIO_ITF_COUNT];
+static uint8_t idle_proto[PIO_ITF_COUNT];    // HID protocol it was built for
+static uint32_t last_sent_ms[PIO_ITF_COUNT];
+
+static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
+
+static bool send_report(endpoint_t *ep, uint8_t itf, const uint8_t *data, uint8_t len) {
+  memcpy(ep_buf[itf], data, len);
+  if (pio_usb_set_out_data(ep, ep_buf[itf], len) != 0) return false;
+  uint8_t *idle = idle_rep[itf];
+  memcpy(idle, data, len);
+  if (itf == PIO_ITF_MOUSE) {
+    if (len == 3) {                              // boot: buttons, x, y
+      idle[1] = idle[2] = 0;
+    } else if (idle[0] == REPORT_ID_REL) {       // buttons, x, y, wheel, pan
+      memset(idle + 2, 0, (size_t)len - 2);
+    } else {                                     // abs: keep position, no wheel
+      idle[len - 1] = 0;
+    }
+  }
+  idle_len[itf] = len;
+  idle_proto[itf] = pio_usb_device_hid_protocol[itf];
+  last_sent_ms[itf] = now_ms();
+  return true;
+}
+
+static void keepalive(endpoint_t *ep, uint8_t itf) {
+  if (!idle_len[itf] || now_ms() - last_sent_ms[itf] < KEEPALIVE_MS) return;
+  if (idle_proto[itf] != pio_usb_device_hid_protocol[itf]) {
+    idle_len[itf] = 0;   // the host switched boot/report protocol: format is stale
+    return;
+  }
+  send_report(ep, itf, idle_rep[itf], idle_len[itf]);
+}
+
 static endpoint_t *idle_endpoint(usb_device_t *dev, uint8_t epnum) {
   endpoint_t *ep = pio_usb_get_endpoint(dev, epnum);
   if (!ep || ep->has_transfer) return NULL;
@@ -120,18 +163,22 @@ static void pump_hid(void) {
 
   hidq_t *q = &bridge_q[HID_ITF_KEYBOARD];
   const uint8_t *r = hidq_peek(q);
-  if (r && (ep = idle_endpoint(dev, PIO_EP_KEYBOARD))) {
-    memcpy(ep_buf[PIO_ITF_KEYBOARD], r, sizeof(kbd_report_t));
-    if (pio_usb_set_out_data(ep, ep_buf[PIO_ITF_KEYBOARD], sizeof(kbd_report_t)) == 0) hidq_pop(q);
+  if ((ep = idle_endpoint(dev, PIO_EP_KEYBOARD))) {
+    if (!r) keepalive(ep, PIO_ITF_KEYBOARD);
+    else if (send_report(ep, PIO_ITF_KEYBOARD, r, sizeof(kbd_report_t))) hidq_pop(q);
   }
 
+  if (!(ep = idle_endpoint(dev, PIO_EP_MOUSE))) return;
   hidq_t *qa = &bridge_q[HID_ITF_MOUSE_ABS], *qr = &bridge_q[HID_ITF_MOUSE_REL];
   bool has_a = hidq_peek(qa) != NULL, has_r = hidq_peek(qr) != NULL;
-  if (!(has_a || has_r) || !(ep = idle_endpoint(dev, PIO_EP_MOUSE))) return;
+  if (!(has_a || has_r)) {
+    keepalive(ep, PIO_ITF_MOUSE);
+    return;
+  }
   q = (has_r && (mouse_rel_turn || !has_a)) ? qr : qa;
   mouse_rel_turn = q != qr;
   r = hidq_peek(q);
-  uint8_t *b = ep_buf[PIO_ITF_MOUSE];
+  uint8_t b[8];
   uint8_t len;
   if (pio_usb_device_hid_protocol[PIO_ITF_MOUSE] == 0) {
     // boot protocol (BIOS/UEFI): 3-byte relative report; absolute input
@@ -146,7 +193,7 @@ static void pump_hid(void) {
     memcpy(b + 1, r, q->size);
     len = (uint8_t)(q->size + 1);
   }
-  if (pio_usb_set_out_data(ep, b, len) == 0) hidq_pop(q);
+  if (send_report(ep, PIO_ITF_MOUSE, b, len)) hidq_pop(q);
 }
 
 // ---- CDC link to the KVM host (native USB-C) ------------------------------
