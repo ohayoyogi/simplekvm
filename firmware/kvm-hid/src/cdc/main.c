@@ -42,20 +42,25 @@ static const tusb_desc_device_t pio_desc_device = {
     .bNumConfigurations = 1,
 };
 
-#define PIO_CONFIG_LEN (TUD_CONFIG_DESC_LEN + 3 * TUD_HID_DESC_LEN)
+// Two interfaces only, polled at 8 / 4 ms: PIO-USB receives in software and
+// every IN token is work for it (three 1 ms interfaces meant three tokens
+// back to back after each SOF). Both pointers share the boot mouse.
+enum { PIO_ITF_KEYBOARD = 0, PIO_ITF_MOUSE, PIO_ITF_COUNT };
+#define PIO_EP_KEYBOARD 1
+#define PIO_EP_MOUSE 2
+#define PIO_CONFIG_LEN (TUD_CONFIG_DESC_LEN + PIO_ITF_COUNT * TUD_HID_DESC_LEN)
 #define PIO_EP_SIZE 16
 
 static const uint8_t pio_desc_config[] = {
-    TUD_CONFIG_DESCRIPTOR(1, HID_ITF_COUNT, 0, PIO_CONFIG_LEN, 0, 100),
-    TUD_HID_DESCRIPTOR(HID_ITF_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD, HID_DESC_KEYBOARD_LEN,
-                       0x81, PIO_EP_SIZE, 1),
-    TUD_HID_DESCRIPTOR(HID_ITF_MOUSE_ABS, 0, HID_ITF_PROTOCOL_NONE, HID_DESC_MOUSE_ABS_LEN,
-                       0x82, PIO_EP_SIZE, 1),
-    TUD_HID_DESCRIPTOR(HID_ITF_MOUSE_REL, 0, HID_ITF_PROTOCOL_MOUSE, HID_DESC_MOUSE_REL_LEN,
-                       0x83, PIO_EP_SIZE, 1),
+    TUD_CONFIG_DESCRIPTOR(1, PIO_ITF_COUNT, 0, PIO_CONFIG_LEN, 0, 100),
+    TUD_HID_DESCRIPTOR(PIO_ITF_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD, HID_DESC_KEYBOARD_LEN,
+                       0x80 | PIO_EP_KEYBOARD, PIO_EP_SIZE, 8),
+    TUD_HID_DESCRIPTOR(PIO_ITF_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE, HID_DESC_MOUSE_COMBO_LEN,
+                       0x80 | PIO_EP_MOUSE, PIO_EP_SIZE, 4),
 };
+_Static_assert(sizeof(pio_desc_config) <= 64, "configuration descriptor fits one packet");
 
-static const uint8_t *pio_report_desc[HID_ITF_COUNT];
+static const uint8_t *pio_report_desc[PIO_ITF_COUNT];
 static const char *const pio_strings[] = {
     (const char[]){0x09, 0x04}, "dev_tinker", "dev_tinker KVM keyboard/mouse", "0001",
 };
@@ -82,9 +87,8 @@ static void core1_main(void) {
   sleep_ms(10);
   static pio_usb_configuration_t config = PIO_USB_DEFAULT_CONFIG;
   config.pin_dp = PICO_DEFAULT_PIO_USB_DP_PIN;   // GP12, D- = GP13
-  pio_report_desc[HID_ITF_KEYBOARD] = hid_desc_keyboard;
-  pio_report_desc[HID_ITF_MOUSE_ABS] = hid_desc_mouse_abs;
-  pio_report_desc[HID_ITF_MOUSE_REL] = hid_desc_mouse_rel;
+  pio_report_desc[PIO_ITF_KEYBOARD] = hid_desc_keyboard;
+  pio_report_desc[PIO_ITF_MOUSE] = hid_desc_mouse_combo;
   init_strings();
   pio_desc.device = (const uint8_t *)&pio_desc_device;
   pio_desc.config = pio_desc_config;
@@ -96,23 +100,53 @@ static void core1_main(void) {
 
 // Reports must stay valid until the PIO transfer completes, so each endpoint
 // has its own buffer that is only rewritten when the endpoint is idle.
-static uint8_t ep_buf[HID_ITF_COUNT][8];
+static uint8_t ep_buf[PIO_ITF_COUNT][8];
+static bool mouse_rel_turn;   // both pointer queues pending: alternate
+
+static endpoint_t *idle_endpoint(usb_device_t *dev, uint8_t epnum) {
+  endpoint_t *ep = pio_usb_get_endpoint(dev, epnum);
+  if (!ep || ep->has_transfer) return NULL;
+  // With patches/pico-pio-usb-*-device-fixes.patch the endpoint is idle but
+  // still owned by core1 while its last packet's continue is pending.
+  __dmb();
+  if (PIO_USB_ROOT_PORT(0)->ep_continue & (1u << epnum)) return NULL;
+  return ep;
+}
 
 static void pump_hid(void) {
   usb_device_t *dev = pio_dev;
   if (!dev) return;
-  for (uint8_t itf = 0; itf < HID_ITF_COUNT; itf++) {
-    const uint8_t *r = hidq_peek(&bridge_q[itf]);
-    if (!r) continue;
-    endpoint_t *ep = pio_usb_get_endpoint(dev, (uint8_t)(itf + 1));
-    if (!ep || ep->has_transfer) continue;
-    // With patches/pico-pio-usb-*-device-continue.patch the endpoint is idle
-    // but still owned by core1 while its last packet's continue is pending.
-    __dmb();
-    if (PIO_USB_ROOT_PORT(0)->ep_continue & (1u << (itf + 1))) continue;
-    memcpy(ep_buf[itf], r, bridge_q[itf].size);
-    if (pio_usb_set_out_data(ep, ep_buf[itf], bridge_q[itf].size) == 0) hidq_pop(&bridge_q[itf]);
+  endpoint_t *ep;
+
+  hidq_t *q = &bridge_q[HID_ITF_KEYBOARD];
+  const uint8_t *r = hidq_peek(q);
+  if (r && (ep = idle_endpoint(dev, PIO_EP_KEYBOARD))) {
+    memcpy(ep_buf[PIO_ITF_KEYBOARD], r, sizeof(kbd_report_t));
+    if (pio_usb_set_out_data(ep, ep_buf[PIO_ITF_KEYBOARD], sizeof(kbd_report_t)) == 0) hidq_pop(q);
   }
+
+  hidq_t *qa = &bridge_q[HID_ITF_MOUSE_ABS], *qr = &bridge_q[HID_ITF_MOUSE_REL];
+  bool has_a = hidq_peek(qa) != NULL, has_r = hidq_peek(qr) != NULL;
+  if (!(has_a || has_r) || !(ep = idle_endpoint(dev, PIO_EP_MOUSE))) return;
+  q = (has_r && (mouse_rel_turn || !has_a)) ? qr : qa;
+  mouse_rel_turn = q != qr;
+  r = hidq_peek(q);
+  uint8_t *b = ep_buf[PIO_ITF_MOUSE];
+  uint8_t len;
+  if (pio_usb_device_hid_protocol[PIO_ITF_MOUSE] == 0) {
+    // boot protocol (BIOS/UEFI): 3-byte relative report; absolute input
+    // can only pass its buttons
+    bool rel = q == qr;
+    b[0] = rel ? ((const rel_report_t *)r)->buttons : ((const abs_report_t *)r)->buttons;
+    b[1] = rel ? (uint8_t)((const rel_report_t *)r)->x : 0;
+    b[2] = rel ? (uint8_t)((const rel_report_t *)r)->y : 0;
+    len = 3;
+  } else {
+    b[0] = q == qr ? REPORT_ID_REL : REPORT_ID_ABS;
+    memcpy(b + 1, r, q->size);
+    len = (uint8_t)(q->size + 1);
+  }
+  if (pio_usb_set_out_data(ep, b, len) == 0) hidq_pop(q);
 }
 
 // ---- CDC link to the KVM host (native USB-C) ------------------------------
