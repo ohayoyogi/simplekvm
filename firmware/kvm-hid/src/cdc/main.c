@@ -6,6 +6,9 @@
 // connect it to a PC you need an A-to-A cable with VBUS (pin 1) cut, or the
 // two 5 V supplies get tied together.
 //
+// Hardware mod needed: a 1.5 kOhm pull-up from D+ (GP12) to 3V3. Pico-PIO-USB
+// device mode has none built in, and without it the PC never sees an attach.
+//
 // Limitation: Pico-PIO-USB's device stack discards SET_REPORT data, so the
 // target's keyboard LEDs (Caps/Num) are not reported back in this variant.
 #include <stdio.h>
