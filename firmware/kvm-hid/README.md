@@ -5,7 +5,7 @@ Waveshare RP2350-USB-A を、KVM ホスト（Tinker Board）からの 1 行コ�
 | UF2 | ホストとのつなぎ方 | 操作される側 PC へ | 必要なもの |
 |---|---|---|---|
 | `kvm_hid_uart.uf2` | UART（GP0 = TX, GP1 = RX, 3.3 V）115200 bps | **USB-C**（ネイティブ USB, TinyUSB） | ジャンパ線 3 本 |
-| `kvm_hid_cdc.uf2` | **USB-C**（CDC ACM, `/dev/ttyACM*`） | **USB-A**（PIO-USB, GP12/13, Full-Speed） | VBUS を切った A–A ケーブル、**D+ に 1.5 kΩ のプルアップ（はんだ付け）** |
+| `kvm_hid_cdc.uf2` | **USB-C**（CDC ACM, `/dev/ttyACM*`） | **USB-A**（PIO-USB, GP12/13, Full-Speed） | VBUS を切った A–A ケーブル |
 
 どちらも、相手からは「ブートキーボード＋絶対座標マウス＋ブートマウス（相対）」の複合 HID に見える。BIOS/UEFI では相対マウスを使う。
 
@@ -22,7 +22,6 @@ Waveshare RP2350-USB-A を、KVM ホスト（Tinker Board）からの 1 行コ�
 - Tinker のシリアルコンソールは UART2（ttyS2）なので、UART1 と競合しない。
 
 ### CDC 版
-- **RP2350 の GP12（USB-A の D+）と 3V3 の間に 1.5 kΩ の抵抗を付ける必要がある。** Pico-PIO-USB のデバイスモードは D+ のプルアップを内蔵していない（`pio_usb_device.c` の `gpio_disable_pulls(pin_dp); // needs external pull-up`）。ボードの USB-A はホスト用なので、この抵抗はない。付けないと、相手 PC は何も挿さっていないと判断する（2026-10-24 に実機で確認）。
 - Tinker の USB-A → RP2350 の USB-C（普通のケーブル。RP2350 は Tinker から給電される）。
 - RP2350 の USB-A → 相手 PC の USB-A: **ボードの USB-A はホスト用で 5V を出している。A–A ケーブルは VBUS（1 番ピン）を切ったものを使うこと。** 切らないと Tinker 側と相手 PC 側の 5V がつながってしまう。
 
@@ -62,5 +61,4 @@ RP2350 からは `L xx`（キーボード LED）が返る。CDC 版は Pico-PIO-
 
 ## 実機で未確認のこと
 - 両方とも、ビルドとホスト側テストまで（2026-10-21）。実機での列挙、BIOS での動作、PIO-USB の安定性は未確認。
-- CDC 版（2026-10-24）: USB-C 側の CDC は動いた（1200 bps で開くと書き込みモードに入るので、BOOT ボタンなしで書き換えられた。`?` に `OK kvm-hid cdc 0.1` が返る）。USB-A 側は、上記のプルアップがないため列挙されなかった。
 - WS2812 の色の並び（GRB を仮定）。
