@@ -14,14 +14,18 @@ index 30a87d3..353a867 100644
  int pio_usb_set_out_data(endpoint_t *ep, const uint8_t *buffer, uint8_t len);
  
 diff --git a/src/pio_usb_device.c b/src/pio_usb_device.c
-index 5057152..77d61cc 100644
+index 5057152..f0a5375 100644
 --- a/src/pio_usb_device.c
 +++ b/src/pio_usb_device.c
-@@ -22,8 +22,12 @@
+@@ -22,8 +22,16 @@
  #include "hardware/irq.h"
  #include "hardware/gpio.h"
  #include "hardware/pio.h"
 +#include "hardware/sync.h"
++
++#if !defined(PICO_PIO_VERSION) || PICO_PIO_VERSION == 0
++#error "device mode uses usb_dev_rx, which needs RP2350 PIO (IN_COUNT for mov x, pins)"
++#endif
  
  static uint8_t new_devaddr = 0;
 +// HID protocol per interface as set by SET_PROTOCOL (0 boot, 1 report; 1
@@ -30,96 +34,437 @@ index 5057152..77d61cc 100644
  static uint8_t ep0_crc5_lut[16];
  static __unused usb_descriptor_buffers_t descriptor_buffers;
  
-@@ -42,11 +46,35 @@ static void __no_inline_not_in_flash_func(update_ep0_crc5_lut)(uint8_t addr) {
- }
- 
- static __always_inline void restart_usb_receiver(pio_port_t *pp) {
-+  // drop a leftover bit trigger before the restart (see rearm_receiver_at_eop)
-+  pp->pio_usb_rx->irq = 1u << DECODER_TRIGGER;
-   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
-   pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
-   pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
- }
- 
-+// Re-arm the receiver as soon as the current packet's EOP is seen. The edge
-+// detector stalls on "irq wait IRQ_RX_EOP" until the CPU clears that flag,
-+// and the next packet may start ~4 bit times (~330 ns) after EOP: right after
-+// SOF a hub's TT sends the periodic (interrupt) IN tokens. Restart the
-+// decoder and release the detector first; the FIFO is cleared afterwards
-+// (the next byte needs > 600 ns to arrive).
-+static __always_inline void rearm_receiver_at_eop(pio_port_t *pp) {
-+  while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
-+    continue;
-+  }
-+  // SM restart does not clear IRQ flags: drop a leftover bit trigger while
-+  // the detector is still parked on EOP, or the decoder shifts it in as the
-+  // first bit of the next packet (SYNC/PID one bit off). Also put the
-+  // decoder back at its first instruction (restart keeps the PC).
-+  pp->pio_usb_rx->irq = 1u << DECODER_TRIGGER;
-+  pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr);
-+  pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
-+  pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
-+  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
-+  pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
-+}
-+
- static __always_inline uint8_t device_receive_token(void) {
-   pio_port_t *pp = PIO_USB_PIO_PORT(0);
-   uint8_t idx = 0;
-@@ -135,6 +163,9 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
-   if (token == USB_PID_IN) {
-     int8_t ep_num = device_receive_ep_address(token, addr);
-     if (ep_num < 0) {
-+      // IN for another device on the same TT: re-arm right at its EOP, or
-+      // the packet that follows (often our own IN) is lost
-+      rearm_receiver_at_eop(pp);
-       gpio_set_mask(1 << 3);
-       return;
-     }
-@@ -178,8 +209,14 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
-         update_ep0_crc5_lut(rport->dev_addr);
-       }
- 
--      rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
-+      // The next packet is encoded later by pio_usb_device_task(). Until then
-+      // answer NAK: leaving has_transfer set would send this packet again and
-+      // the pending continue would then skip data (multi-packet transfers
-+      // such as a configuration descriptor over 64 bytes broke this way).
-       rport->ep_continue |= (1 << ep_num);
-+      __dmb();
-+      ep->has_transfer = false;
-+      rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
-     } else {
-       pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
-       irq_clear(pp->device_rx_irq_num);
-@@ -192,8 +229,8 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
-     }
-   } else if (token == USB_PID_OUT) {
-     int8_t ep_num = device_receive_ep_address(token, addr);
--    wait_receive_complete(pp);
--    restart_usb_receiver(pp);
-+    // the DATA packet follows the token within a few bit times
-+    rearm_receiver_at_eop(pp);
-     if (ep_num < 0) {
-       return;
-     }
-@@ -246,13 +283,10 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
-     }
-   } else if (token == USB_PID_SOF) {
-     // SOF interrupt
--    device_receive_ep_address(token, addr);
--    wait_receive_complete(pp);
--    restart_usb_receiver(pp);
-+    rearm_receiver_at_eop(pp);
-   } else {
--    device_receive_ep_address(token, addr);
--    wait_receive_complete(pp);
--    restart_usb_receiver(pp);
-+    // late (packet already over), corrupt or non-token packet
-+    rearm_receiver_at_eop(pp);
+@@ -41,219 +49,245 @@ static void __no_inline_not_in_flash_func(update_ep0_crc5_lut)(uint8_t addr) {
    }
  }
  
+-static __always_inline void restart_usb_receiver(pio_port_t *pp) {
+-  pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
+-  pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
+-  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
++// ---- device receiver: usb_dev_rx (see usb_rx.pio) -------------------------
++// The state machine decodes every packet on its own and pushes its bytes
++// (byte << 24) followed by an end marker, so the CPU only has to keep the
++// FIFO from filling up. It is stopped while we transmit (no echo of our own
++// packets) and restarted at "start" afterwards.
++
++#define RX_MARK 0xffffffffu
++#define RX_MAX_PACKET (64 + 4)       // SYNC, PID, payload, CRC16
++
++static uint dev_rx_start_pc;
++static uint8_t ack_encoded[5];
++static uint8_t rx_buf[RX_MAX_PACKET + 4];
++static uint8_t setup_buf[8];
++
++static void __no_inline_not_in_flash_func(rx_restart)(pio_port_t *pp) {
++  PIO pio = pp->pio_usb_rx;
++  uint sm = pp->sm_rx;
++  pio_sm_set_enabled(pio, sm, false);
++  pio_sm_clear_fifos(pio, sm);
++  pio_sm_restart(pio, sm);
++  pio_sm_exec(pio, sm, pio_encode_mov(pio_isr, pio_null));
++  pio_sm_exec(pio, sm, pio_encode_mov_not(pio_osr, pio_null));
++  pio_sm_exec(pio, sm, pio_encode_jmp(dev_rx_start_pc));
++  pio->irq = IRQ_RX_START_MASK;
++  pio_sm_set_enabled(pio, sm, true);
+ }
+ 
+-static __always_inline uint8_t device_receive_token(void) {
+-  pio_port_t *pp = PIO_USB_PIO_PORT(0);
+-  uint8_t idx = 0;
+-  uint8_t buffer[2];
+-
+-  if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
+-    while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
+-      if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
+-        buffer[idx++] = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
+-        if (idx == 2) {
+-          return buffer[1];
+-        }
++// Read one packet up to its end marker into rx_buf (SYNC included).
++// Returns its length, or -1 if nothing arrives in time (bytes come every
++// ~0.7 us; a reply starts within ~1.5 us) or the packet does not fit.
++// crc_ok: the last two bytes are the CRC16 of the bytes after the PID.
++static int __no_inline_not_in_flash_func(rx_packet)(pio_port_t *pp, bool *crc_ok) {
++  PIO pio = pp->pio_usb_rx;
++  uint sm = pp->sm_rx;
++  uint16_t crc = 0xffff, crc1 = 0xffff, crc2 = 0xffff;
++  int n = 0;
++  uint32_t t0 = get_time_us_32();
++  while (true) {
++    if (pio_sm_is_rx_fifo_empty(pio, sm)) {
++      if (get_time_us_32() - t0 > 3) {
++        return -1;
+       }
++      continue;
+     }
+-  } else {
+-    // host is probably timeout. Ignore this packets.
+-    pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
+-  }
+-
+-  return 0;
+-}
+-
+-static __always_inline int8_t device_receive_ep_address(uint8_t token,
+-                                                        uint8_t dev_addr) {
+-  pio_port_t *pp = PIO_USB_PIO_PORT(0);
+-  uint8_t idx = 0;
+-  uint8_t addr;
+-  uint8_t ep;
+-  uint8_t ep_num = 0;
+-  uint8_t buffer[3];
+-  bool match = false;
+-
+-  static uint8_t eplut[2][8] = {{0, 2, 4, 6, 8, 10, 12, 14},
+-                                {1, 3, 5, 7, 9, 11, 13, 15}};
+-  uint8_t *current_lut;
+-
+-  if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
+-    while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
+-      if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
+-        buffer[idx++] = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
+-        if ((idx == 1) && (token != USB_PID_SOF)) {
+-          addr = buffer[0] & 0x7f;
+-          current_lut = &eplut[buffer[0] >> 7][0];
+-          match = dev_addr == addr ? true : false;
+-        } else if (idx == 2) {
+-          ep_num = buffer[1];
+-          break;
+-        }
+-      }
++    uint32_t w = pio->rxf[sm];
++    if (w == RX_MARK) {
++      break;
+     }
+-  } else {
+-    // host is probably timeout. Ignore this packets.
+-    pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
+-  }
+-
+-  if (match) {
+-    ep = current_lut[ep_num & 0x07];
+-    if (ep0_crc5_lut[ep] == ep_num) {
+-      return ep;
+-    } else {
+-      return -1;
++    t0 = get_time_us_32();
++    uint8_t b = (uint8_t)(w >> 24);
++    if (n < (int)sizeof(rx_buf)) {
++      rx_buf[n] = b;
+     }
++    if (n >= 2) {
++      crc2 = crc1;
++      crc1 = crc;
++      crc = update_usb_crc16(crc, b);
++    }
++    n++;
+   }
+-
+-  return -1;
++  if (n > (int)sizeof(rx_buf)) {
++    return -1;
++  }
++  *crc_ok = n >= 4 && (uint16_t)((rx_buf[n - 2] | (rx_buf[n - 1] << 8)) ^ 0xffff) == crc2;
++  return n;
+ }
+ 
+-static __always_inline void wait_receive_complete(pio_port_t *pp) {
+-  while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
++// Send an encoded packet; the receiver is off meanwhile.
++static void __no_inline_not_in_flash_func(tx_packet)(pio_port_t *pp, const uint8_t *data,
++                                                      uint len) {
++  pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
++  pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
++  dma_channel_transfer_from_buffer_now(pp->tx_ch, data, len);
++  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
++  while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
+     continue;
+   }
+-  pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
++  rx_restart(pp);
+ }
+ 
+-static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+-  pio_port_t *pp = PIO_USB_PIO_PORT(0);
+-  root_port_t *rport = PIO_USB_ROOT_PORT(0);
+-
+-  gpio_clr_mask(1<<3);
+-  //
+-  // time critical start
+-  //
+-  uint8_t addr = rport->dev_addr;
+-  uint8_t token = device_receive_token();
+-
+-  if (token == USB_PID_IN) {
+-    int8_t ep_num = device_receive_ep_address(token, addr);
+-    if (ep_num < 0) {
+-      gpio_set_mask(1 << 3);
+-      return;
+-    }
+-
+-    endpoint_t *ep = PIO_USB_ENDPOINT((ep_num << 1) | 0x01);
++// Endpoint number of a token for this device, else -1 (address or CRC5
++// mismatch). b2 = ADDR | ENDP[0] << 7, b3 = ENDP[3:1] | CRC5 << 3.
++static __always_inline int token_ep(uint8_t b2, uint8_t b3, uint8_t dev_addr) {
++  if ((b2 & 0x7f) != dev_addr) {
++    return -1;
++  }
++  uint8_t ep = (uint8_t)(((b3 & 0x07) << 1) | (b2 >> 7));
++  return ep0_crc5_lut[ep] == b3 ? ep : -1;
++}
+ 
+-    pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_start_instr);
+-    volatile bool has_transfer = ep->has_transfer;
++static void __no_inline_not_in_flash_func(device_in)(pio_port_t *pp, root_port_t *rport,
++                                                      int ep_num) {
++  endpoint_t *ep = PIO_USB_ENDPOINT((ep_num << 1) | 0x01);
++  bool const has_transfer = ep->has_transfer;
++  if (has_transfer) {
++    tx_packet(pp, ep->buffer, ep->encoded_data_len);
++  } else if (ep->stalled) {
++    tx_packet(pp, stall_encoded, sizeof(stall_encoded));
++  } else {
++    tx_packet(pp, nak_encoded, sizeof(nak_encoded));
++  }
++  if (!has_transfer) {
++    return;
++  }
+ 
+-    if (has_transfer) {
+-      dma_channel_transfer_from_buffer_now(pp->tx_ch, ep->buffer, ep->encoded_data_len);
+-    } else if (ep->stalled) {
+-      dma_channel_transfer_from_buffer_now(pp->tx_ch, stall_encoded, sizeof(stall_encoded));
+-    } else {
+-      dma_channel_transfer_from_buffer_now(pp->tx_ch, nak_encoded, sizeof(nak_encoded));
+-    }
++  // Advance only on the host's ACK; otherwise the same packet (same data
++  // toggle) goes out again on the next IN, as USB expects.
++  bool crc_ok;
++  if (rx_packet(pp, &crc_ok) != 2 || rx_buf[1] != USB_PID_ACK) {
++    return;
++  }
+ 
+-    pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
+-    while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
+-      continue;
+-    }
++  if (ep->ep_num == 0x80 && new_devaddr > 0) {
++    rport->dev_addr = new_devaddr;
++    new_devaddr = 0;
++    update_ep0_crc5_lut(rport->dev_addr);
++  }
+ 
+-    if (has_transfer) {
+-      pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+-      irq_clear(pp->device_rx_irq_num);
+-      pio_usb_bus_start_receive(pp);
++  // The next packet is encoded later by pio_usb_device_task(). Until then
++  // answer NAK: leaving has_transfer set would send this packet again and
++  // the pending continue would then skip data (multi-packet transfers such
++  // as a configuration descriptor over 64 bytes broke this way).
++  rport->ep_continue |= (1 << ep_num);
++  __dmb();
++  ep->has_transfer = false;
++  rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
++}
+ 
+-      // wait for ack
+-      pio_usb_bus_wait_handshake(pp);
++static void __no_inline_not_in_flash_func(device_out)(pio_port_t *pp, int ep_num) {
++  endpoint_t *ep = PIO_USB_ENDPOINT(ep_num << 1);
++  bool crc_ok;
++  int n = rx_packet(pp, &crc_ok);
++  if (n < 4 || (rx_buf[1] != USB_PID_DATA0 && rx_buf[1] != USB_PID_DATA1) || !crc_ok) {
++    return; // no handshake: the host retries
++  }
++  if (ep->stalled) {
++    tx_packet(pp, stall_encoded, sizeof(stall_encoded));
++    return;
++  }
++  if (!ep->has_transfer) {
++    tx_packet(pp, nak_encoded, sizeof(nak_encoded));
++    return;
++  }
++  tx_packet(pp, ack_encoded, sizeof(ack_encoded));
++
++  // Clamp to the transaction length the device actually allocated a buffer
++  // for. A non-compliant or malicious host could otherwise send an OUT
++  // packet larger than ep->app_buf, causing an out-of-bounds memcpy.
++  int res = n - 4;
++  uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
++  if ((uint16_t)res > xact_len) {
++    res = xact_len;
++  }
++  memcpy(ep->app_buf, rx_buf + 2, res);
++  pio_usb_ll_transfer_continue(ep, res);
++}
+ 
+-      pio_usb_bus_start_receive(pp);
+-      irq_clear(pp->device_rx_irq_num);
++static void __no_inline_not_in_flash_func(device_setup)(pio_port_t *pp, root_port_t *rport) {
++  bool crc_ok;
++  int n = rx_packet(pp, &crc_ok);
++  if (n != 12 || rx_buf[1] != USB_PID_DATA0 || !crc_ok) {
++    return;
++  }
++  tx_packet(pp, ack_encoded, sizeof(ack_encoded));
+ 
+-      //
+-      // time critical end
+-      //
++  memcpy(setup_buf, rx_buf + 2, sizeof(setup_buf));
++  rport->setup_packet = setup_buf;
++  rport->ints |= PIO_USB_INTS_SETUP_REQ_BITS;
+ 
+-      if (ep->ep_num == 0x80 && new_devaddr > 0) {
+-        rport->dev_addr = new_devaddr;
+-        new_devaddr = 0;
+-        update_ep0_crc5_lut(rport->dev_addr);
+-      }
++  // DATA1 for both data and status stage
++  PIO_USB_ENDPOINT(0)->has_transfer = PIO_USB_ENDPOINT(1)->has_transfer = false;
++  PIO_USB_ENDPOINT(0)->data_id = PIO_USB_ENDPOINT(1)->data_id = 1;
++  PIO_USB_ENDPOINT(0)->stalled = PIO_USB_ENDPOINT(1)->stalled = false;
++}
+ 
+-      rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
+-      rport->ep_continue |= (1 << ep_num);
+-    } else {
+-      pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+-      irq_clear(pp->device_rx_irq_num);
+-      restart_usb_receiver(pp);
+-      pio_usb_bus_start_receive(pp);
+-
+-      //
+-      // time critical end
+-      //
+-    }
+-  } else if (token == USB_PID_OUT) {
+-    int8_t ep_num = device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
+-    if (ep_num < 0) {
+-      return;
++// PIO IRQ on a packet start: handle packets as long as they keep coming.
++// Everything else on the bus (SOF, traffic for other devices behind the
++// same TT, handshakes) is read and dropped.
++static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
++  pio_port_t *pp = PIO_USB_PIO_PORT(0);
++  root_port_t *rport = PIO_USB_ROOT_PORT(0);
++  PIO pio = pp->pio_usb_rx;
++
++  while (!pio_sm_is_rx_fifo_empty(pio, pp->sm_rx) || (pio->irq & IRQ_RX_START_MASK)) {
++    pio->irq = IRQ_RX_START_MASK; // a packet starting from now on raises it again
++    bool crc_ok;
++    int n = rx_packet(pp, &crc_ok);
++    if (n != 4) {
++      continue; // not a token (or lost): nothing to answer
+     }
+-    endpoint_t *ep = PIO_USB_ENDPOINT(ep_num << 1);
+-
+-  gpio_clr_mask(1<<4);
+-    uint8_t handshake = ep->stalled
+-                           ? USB_PID_STALL
+-                           : (ep->has_transfer ? USB_PID_ACK : USB_PID_NAK);
+-    int res = pio_usb_bus_receive_packet_and_handshake(pp, handshake);
+-    pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
+-    restart_usb_receiver(pp);
+-    pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+-    irq_clear(pp->device_rx_irq_num);
+-
+-    if (ep->has_transfer) {
+-      if (res >= 0) {
+-        // Clamp to the transaction length the device actually allocated a
+-        // buffer for. A non-compliant or malicious host could otherwise send
+-        // an OUT packet larger than ep->app_buf, causing an out-of-bounds
+-        // memcpy.
+-        uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
+-        if ((uint16_t)res > xact_len) {
+-          res = xact_len;
+-        }
+-        memcpy(ep->app_buf, pp->usb_rx_buffer + 2, res);
+-        pio_usb_ll_transfer_continue(ep, res);
+-      }
++    uint8_t const pid = rx_buf[1];
++    if (pid != USB_PID_IN && pid != USB_PID_OUT && pid != USB_PID_SETUP) {
++      continue;
+     }
+-  } else if (token == USB_PID_SETUP) {
+-    int8_t ep_num = device_receive_ep_address(token, addr);
+-    restart_usb_receiver(pp);
++    int ep_num = token_ep(rx_buf[2], rx_buf[3], rport->dev_addr);
+     if (ep_num < 0) {
+-      return;
++      continue;
+     }
+-    int res = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
+-    pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
+-    restart_usb_receiver(pp);
+-    pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+-    irq_clear(pp->device_rx_irq_num);
+-
+-    if (res >= 0) {
+-      rport->setup_packet = pp->usb_rx_buffer + 2;
+-      rport->ints |= PIO_USB_INTS_SETUP_REQ_BITS;
+-
+-      // DATA1 for both data and status stage
+-      PIO_USB_ENDPOINT(0)->has_transfer = PIO_USB_ENDPOINT(1)->has_transfer = false;
+-      PIO_USB_ENDPOINT(0)->data_id = PIO_USB_ENDPOINT(1)->data_id = 1;
+-      PIO_USB_ENDPOINT(0)->stalled = PIO_USB_ENDPOINT(1)->stalled = false;
++    if (pid == USB_PID_IN) {
++      device_in(pp, rport, ep_num);
++    } else if (pid == USB_PID_OUT) {
++      device_out(pp, ep_num);
++    } else {
++      device_setup(pp, rport);
+     }
+-  } else if (token == USB_PID_SOF) {
+-    // SOF interrupt
+-    device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
+-  } else {
+-    device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
+   }
++  irq_clear(pp->device_rx_irq_num);
++}
++
++// Replace the host receiver (usb_nrzi_decoder + usb_edge_detector, which
++// needs the CPU to re-arm it between packets) with usb_dev_rx on sm_rx. It
++// takes all 32 instructions, so the receiver needs a PIO block of its own
++// (pio_rx_num != pio_tx_num).
++static void device_rx_init(pio_port_t *pp, const pio_usb_configuration_t *c,
++                           root_port_t *rport) {
++  PIO pio = pp->pio_usb_rx;
++  pio_sm_set_enabled(pio, pp->sm_rx, false);
++  pio_sm_set_enabled(pio, pp->sm_eop, false);
++  pio_remove_program(pio, c->debug_pin_rx < 0 ? &usb_nrzi_decoder_program
++                                              : &usb_nrzi_decoder_debug_program,
++                     pp->offset_rx);
++  pio_remove_program(pio, c->debug_pin_eop < 0 ? &usb_edge_detector_program
++                                               : &usb_edge_detector_debug_program,
++                     pp->offset_eop);
++  if (!pio_can_add_program(pio, &usb_dev_rx_program)) {
++    panic("pio-usb device: usb_dev_rx needs a PIO block of its own (set pio_rx_num)");
++  }
++  uint offset = pio_add_program(pio, &usb_dev_rx_program);
++  dev_rx_start_pc = offset + usb_dev_rx_offset_start;
++
++  pio_sm_config cfg = usb_dev_rx_program_get_default_config(offset);
++  sm_config_set_in_pins(&cfg, rport->pin_dp);
++  sm_config_set_in_pin_count(&cfg, 1);   // "mov x, pins" reads D+ only
++  sm_config_set_jmp_pin(&cfg, rport->pin_dm);
++  sm_config_set_in_shift(&cfg, true, true, 8);
++  sm_config_set_fifo_join(&cfg, PIO_FIFO_JOIN_RX);
++  sm_config_set_clkdiv(&cfg, (float)clock_get_hz(clk_sys) / 96000000);
++  pio_sm_init(pio, pp->sm_rx, dev_rx_start_pc, &cfg);
++  rx_restart(pp);
+ }
+ 
+ usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
 @@ -272,6 +306,7 @@ usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
    }
  
@@ -128,7 +473,48 @@ index 5057152..77d61cc 100644
  
    float const cpu_freq = (float)clock_get_hz(clk_sys);
  
-@@ -401,7 +436,7 @@ void pio_usb_device_task(void) {
+@@ -282,19 +317,17 @@ usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
+                                   &pp->clk_div_fs_rx.div_int,
+                                   &pp->clk_div_fs_rx.div_frac);
+ 
+-  pio_sm_set_jmp_pin(pp->pio_usb_rx, pp->sm_rx, rport->pin_dp);
+-  pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
+-  SM_SET_CLKDIV_MAXSPEED(pp->pio_usb_rx, pp->sm_rx);
+-  pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
+-
+-  pio_sm_set_jmp_pin(pp->pio_usb_rx, pp->sm_eop, rport->pin_dm);
+-  pio_sm_set_in_pins(pp->pio_usb_rx, pp->sm_eop, rport->pin_dp);
+-  pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, false);
+-  SM_SET_CLKDIV(pp->pio_usb_rx, pp->sm_eop, pp->clk_div_fs_rx);
+-
+   descriptor_buffers = *buffers;
+ 
+-  pio_usb_bus_prepare_receive(pp);
++  // pre-encode handshake packets (before the receiver and its IRQ run)
++  uint8_t raw_packet[] = {USB_SYNC, USB_PID_NAK};
++  pio_usb_ll_encode_tx_data(raw_packet, 2, nak_encoded);
++  raw_packet[1] = USB_PID_ACK;
++  pio_usb_ll_encode_tx_data(raw_packet, 2, ack_encoded);
++  raw_packet[1] = USB_PID_STALL;
++  pio_usb_ll_encode_tx_data(raw_packet, 2, stall_encoded);
++
++  device_rx_init(pp, c, rport);
+ 
+   // configure PIOx_IRQ_0 to detect packet receive start
+   pio_set_irqn_source_enabled(pp->pio_usb_rx, 0, pis_interrupt0 + IRQ_RX_START,
+@@ -304,11 +337,6 @@ usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
+   irq_set_enabled(pp->device_rx_irq_num, true);
+ 
+ 
+-  // pre-encode handshake packets
+-  uint8_t raw_packet[] = {USB_SYNC, USB_PID_NAK};
+-  pio_usb_ll_encode_tx_data(raw_packet, 2, nak_encoded);
+-  raw_packet[1] = USB_PID_STALL;
+-  pio_usb_ll_encode_tx_data(raw_packet, 2, stall_encoded);
+ 
+   return dev;
+ }
+@@ -401,7 +429,7 @@ void pio_usb_device_task(void) {
            (uint8_t *)descriptor_buffers.hid_report[ep0_desc_request_idx],
            ep0_desc_request_len);
        ep0_desc_request_type = -1;
@@ -137,7 +523,7 @@ index 5057152..77d61cc 100644
      default:
        break;
    }
-@@ -428,6 +463,15 @@ void pio_usb_device_task(void) {
+@@ -428,14 +456,21 @@ void pio_usb_device_task(void) {
  
        // TODO should be reset end, this is reset start only
        rport->ep_complete = rport->ep_stalled = rport->ep_error = 0;
@@ -153,7 +539,16 @@ index 5057152..77d61cc 100644
        rport->ints |= PIO_USB_INTS_RESET_END_BITS;
        reset = true;
      }
-@@ -503,9 +547,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
+   }
+   if (reset) {
+-    restart_usb_receiver(pp);
+-    pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, true);
+-    pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
++    rx_restart(pp);
+   }
+ }
+ 
+@@ -503,9 +538,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
        res = 0;
      } else if (packet->request == 0x0B) {
        // set hid protocol request
@@ -180,7 +575,7 @@ index 5057152..77d61cc 100644
    } else if (packet->request_type == (USB_REQ_REC_EP)) {
        prepare_ep0_data(NULL, 0);
        res = 0;
-@@ -562,7 +623,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+@@ -562,7 +614,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
        if (root->ep_continue & (1 << b)) {
          endpoint_t *ep = PIO_USB_ENDPOINT((b << 1) | 0x01);
          uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
@@ -194,3 +589,394 @@ index 5057152..77d61cc 100644
          root->ep_continue &= ~(1 << b);
        }
      }
+diff --git a/src/usb_rx.pio b/src/usb_rx.pio
+index fc71dbf..a318aea 100644
+--- a/src/usb_rx.pio
++++ b/src/usb_rx.pio
+@@ -226,3 +226,74 @@ static inline void eop_detect_fs_program_init(PIO pio, uint sm, uint offset,
+ }
+ 
+ %}
++
++; Full-speed receiver for device mode: edge detection and NRZI decoding in
++; one state machine (simplekvm firmware/kvm-hid, checked cycle by cycle in
++; test/pio_rx_sim.py). Unlike usb_edge_detector + usb_nrzi_decoder it never
++; waits for the CPU between packets: every packet enters through "start"
++; (idle J -> K), so the line level (which loop runs), the stuff counter (y)
++; and the ISR start fresh, and back-to-back packets (a TT sends interrupt INs
++; right after SOF) are all received.
++;
++; Run at 96 MHz (8 cycles per bit on every path). jmp_pin = D-, in_base =
++; D+ with IN_COUNT = 1 (RP2350), both inputs inverted: D- reads 1 for J and
++; SE0, D+ reads 1 for K and SE0. Shift right, autopush 8: each byte arrives
++; as (byte << 24). After a packet, 0xffffffff is pushed as an end marker (a
++; data word always has its low 24 bits clear). OSR must hold all ones.
++;
++; Every timing reference is a detected edge, which lags the wire by the
++; synchronizer, the rise time and the clock divider's jitter (1 to ~3
++; cycles). The K loop watches for the next rising edge with 6 polls covering
++; -2..+3 cycles around its expected time; line states are read 3+ cycles
++; after the reference edge.
++.program usb_dev_rx
++rise:
++    mov y, y [1]                ; rising edge (J or SE0): let it settle
++    mov x, pins                 ; D+: 0 = J, 1 = SE0
++    jmp !x j_trans
++    jmp eop
++j_trans:
++    jmp !y j_stuffed            ; transition after six ones: stuffed bit
++j_zero:
++    in null, 1                  ; went J: 0
++j_c1:
++    set y, 6 [2]
++    jmp j_chk
++j_stuffed:
++    jmp j_c1                    ; no bit
++j_one:
++    in osr, 1                   ; still J: 1
++    jmp y-- j_count
++j_count:
++    jmp !y j_chk_st [2]         ; six ones: the next bit must be a stuffed transition
++j_chk:
++    jmp pin j_smp               ; still J or SE0?
++k_zero:
++    in null, 1                  ; went K: 0
++k_c1:
++    set y, 6
++.wrap_target
++k_poll:
++    jmp pin rise
++    jmp pin rise
++    jmp pin rise
++    jmp pin rise
++    jmp pin rise
++    jmp pin rise
++k_one:
++    in osr, 1                   ; still K: 1
++    jmp y-- k_poll
++.wrap
++j_chk_st:
++    jmp pin j_smp               ; J again: stuffing error, carry on
++    jmp k_c1                    ; K: stuffed transition, no bit
++j_smp:
++    mov x, pins                 ; D+
++    jmp !x j_one
++eop:
++    mov isr, ~null              ; SE0: drop a partial byte (bad packet) and
++    push noblock                ; push 0xffffffff as the end marker
++public start:
++    jmp pin start               ; idle J/SE0 until K
++    irq IRQ_RX_START [1]
++    jmp k_zero                  ; first SYNC bit: a transition
+diff --git a/src/usb_rx.pio.h b/src/usb_rx.pio.h
+index 5212aa1..d146694 100644
+--- a/src/usb_rx.pio.h
++++ b/src/usb_rx.pio.h
+@@ -1,6 +1,6 @@
+-// -------------------------------------------------- //
+-// This file is autogenerated by pioasm; do not edit! //
+-// -------------------------------------------------- //
++// ---------------------------------------------------------------- //
++// This file is autogenerated by pioasm version 2.3.1; do not edit! //
++// ---------------------------------------------------------------- //
+ 
+ #pragma once
+ 
+@@ -8,6 +8,12 @@
+ #include "hardware/pio.h"
+ #endif
+ 
++#ifdef __cpp_constexpr
++#define __pio_const constexpr
++#else
++#define __pio_const const
++#endif
++
+ #define IRQ_RX_BS_ERR 1
+ #define IRQ_RX_EOP 2
+ #define IRQ_RX_START 3
+@@ -19,34 +25,39 @@
+ 
+ #define usb_edge_detector_wrap_target 3
+ #define usb_edge_detector_wrap 9
++#define usb_edge_detector_pio_version 0
+ 
+-static const uint16_t usb_edge_detector_program_instructions[] = {
+-    0xc022, //  0: irq    wait 2                     
+-    0x00c1, //  1: jmp    pin, 1                     
+-    0xc103, //  2: irq    nowait 3               [1] 
++static __pio_const uint16_t usb_edge_detector_program_instructions[] = {
++    0xc022, //  0: irq    wait 2
++    0x00c1, //  1: jmp    pin, 1
++    0xc103, //  2: irq    nowait 3               [1]
+             //     .wrap_target
+-    0xc104, //  3: irq    nowait 4               [1] 
+-    0x00cc, //  4: jmp    pin, 12                    
+-    0x00cc, //  5: jmp    pin, 12                    
+-    0x00cc, //  6: jmp    pin, 12                    
+-    0x00cc, //  7: jmp    pin, 12                    
+-    0x00cc, //  8: jmp    pin, 12                    
+-    0x00cc, //  9: jmp    pin, 12                    
++    0xc104, //  3: irq    nowait 4               [1]
++    0x00cc, //  4: jmp    pin, 12
++    0x00cc, //  5: jmp    pin, 12
++    0x00cc, //  6: jmp    pin, 12
++    0x00cc, //  7: jmp    pin, 12
++    0x00cc, //  8: jmp    pin, 12
++    0x00cc, //  9: jmp    pin, 12
+             //     .wrap
+-    0xa126, // 10: mov    x, isr                 [1] 
+-    0x0040, // 11: jmp    x--, 0                     
+-    0xa1c3, // 12: mov    isr, null              [1] 
+-    0xc004, // 13: irq    nowait 4                   
+-    0x4001, // 14: in     pins, 1                    
+-    0x00ca, // 15: jmp    pin, 10                    
+-    0x0006, // 16: jmp    6                          
++    0xa126, // 10: mov    x, isr                 [1]
++    0x0040, // 11: jmp    x--, 0
++    0xa1c3, // 12: mov    isr, null              [1]
++    0xc004, // 13: irq    nowait 4
++    0x4001, // 14: in     pins, 1
++    0x00ca, // 15: jmp    pin, 10
++    0x0006, // 16: jmp    6
+ };
+ 
+ #if !PICO_NO_HARDWARE
+-static const struct pio_program usb_edge_detector_program = {
++static __pio_const struct pio_program usb_edge_detector_program = {
+     .instructions = usb_edge_detector_program_instructions,
+     .length = 17,
+     .origin = -1,
++    .pio_version = usb_edge_detector_pio_version,
++#if PICO_PIO_VERSION > 0
++    .used_gpio_ranges = 0x0
++#endif
+ };
+ 
+ static inline pio_sm_config usb_edge_detector_program_get_default_config(uint offset) {
+@@ -62,34 +73,39 @@ static inline pio_sm_config usb_edge_detector_program_get_default_config(uint of
+ 
+ #define usb_edge_detector_debug_wrap_target 3
+ #define usb_edge_detector_debug_wrap 9
++#define usb_edge_detector_debug_pio_version 0
+ 
+-static const uint16_t usb_edge_detector_debug_program_instructions[] = {
+-    0xc022, //  0: irq    wait 2          side 0     
+-    0x10c1, //  1: jmp    pin, 1          side 1     
+-    0xc103, //  2: irq    nowait 3        side 0 [1] 
++static __pio_const uint16_t usb_edge_detector_debug_program_instructions[] = {
++    0xc022, //  0: irq    wait 2          side 0
++    0x10c1, //  1: jmp    pin, 1          side 1
++    0xc103, //  2: irq    nowait 3        side 0 [1]
+             //     .wrap_target
+-    0xc104, //  3: irq    nowait 4        side 0 [1] 
+-    0x10cc, //  4: jmp    pin, 12         side 1     
+-    0x10cc, //  5: jmp    pin, 12         side 1     
+-    0x10cc, //  6: jmp    pin, 12         side 1     
+-    0x10cc, //  7: jmp    pin, 12         side 1     
+-    0x10cc, //  8: jmp    pin, 12         side 1     
+-    0x10cc, //  9: jmp    pin, 12         side 1     
++    0xc104, //  3: irq    nowait 4        side 0 [1]
++    0x10cc, //  4: jmp    pin, 12         side 1
++    0x10cc, //  5: jmp    pin, 12         side 1
++    0x10cc, //  6: jmp    pin, 12         side 1
++    0x10cc, //  7: jmp    pin, 12         side 1
++    0x10cc, //  8: jmp    pin, 12         side 1
++    0x10cc, //  9: jmp    pin, 12         side 1
+             //     .wrap
+-    0xb126, // 10: mov    x, isr          side 1 [1] 
+-    0x1040, // 11: jmp    x--, 0          side 1     
+-    0xb1c3, // 12: mov    isr, null       side 1 [1] 
+-    0xc004, // 13: irq    nowait 4        side 0     
+-    0x4001, // 14: in     pins, 1         side 0     
+-    0x00ca, // 15: jmp    pin, 10         side 0     
+-    0x1006, // 16: jmp    6               side 1     
++    0xb126, // 10: mov    x, isr          side 1 [1]
++    0x1040, // 11: jmp    x--, 0          side 1
++    0xb1c3, // 12: mov    isr, null       side 1 [1]
++    0xc004, // 13: irq    nowait 4        side 0
++    0x4001, // 14: in     pins, 1         side 0
++    0x00ca, // 15: jmp    pin, 10         side 0
++    0x1006, // 16: jmp    6               side 1
+ };
+ 
+ #if !PICO_NO_HARDWARE
+-static const struct pio_program usb_edge_detector_debug_program = {
++static __pio_const struct pio_program usb_edge_detector_debug_program = {
+     .instructions = usb_edge_detector_debug_program_instructions,
+     .length = 17,
+     .origin = -1,
++    .pio_version = usb_edge_detector_debug_pio_version,
++#if PICO_PIO_VERSION > 0
++    .used_gpio_ranges = 0x0
++#endif
+ };
+ 
+ static inline pio_sm_config usb_edge_detector_debug_program_get_default_config(uint offset) {
+@@ -106,27 +122,32 @@ static inline pio_sm_config usb_edge_detector_debug_program_get_default_config(u
+ 
+ #define usb_nrzi_decoder_wrap_target 0
+ #define usb_nrzi_decoder_wrap 6
++#define usb_nrzi_decoder_pio_version 0
+ 
+-static const uint16_t usb_nrzi_decoder_program_instructions[] = {
++static __pio_const uint16_t usb_nrzi_decoder_program_instructions[] = {
+             //     .wrap_target
+-    0xe046, //  0: set    y, 6                       
+-    0x20c4, //  1: wait   1 irq, 4                   
+-    0x0066, //  2: jmp    !y, 6                      
+-    0x00c7, //  3: jmp    pin, 7                     
+-    0x0028, //  4: jmp    !x, 8                      
+-    0x4061, //  5: in     null, 1                    
+-    0xa029, //  6: mov    x, !x                      
++    0xe046, //  0: set    y, 6
++    0x20c4, //  1: wait   1 irq, 4
++    0x0066, //  2: jmp    !y, 6
++    0x00c7, //  3: jmp    pin, 7
++    0x0028, //  4: jmp    !x, 8
++    0x4061, //  5: in     null, 1
++    0xa029, //  6: mov    x, ~x
+             //     .wrap
+-    0x0025, //  7: jmp    !x, 5                      
+-    0x40e1, //  8: in     osr, 1                     
+-    0x0081, //  9: jmp    y--, 1                     
++    0x0025, //  7: jmp    !x, 5
++    0x40e1, //  8: in     osr, 1
++    0x0081, //  9: jmp    y--, 1
+ };
+ 
+ #if !PICO_NO_HARDWARE
+-static const struct pio_program usb_nrzi_decoder_program = {
++static __pio_const struct pio_program usb_nrzi_decoder_program = {
+     .instructions = usb_nrzi_decoder_program_instructions,
+     .length = 10,
+     .origin = -1,
++    .pio_version = usb_nrzi_decoder_pio_version,
++#if PICO_PIO_VERSION > 0
++    .used_gpio_ranges = 0x0
++#endif
+ };
+ 
+ static inline pio_sm_config usb_nrzi_decoder_program_get_default_config(uint offset) {
+@@ -142,27 +163,32 @@ static inline pio_sm_config usb_nrzi_decoder_program_get_default_config(uint off
+ 
+ #define usb_nrzi_decoder_debug_wrap_target 0
+ #define usb_nrzi_decoder_debug_wrap 6
++#define usb_nrzi_decoder_debug_pio_version 0
+ 
+-static const uint16_t usb_nrzi_decoder_debug_program_instructions[] = {
++static __pio_const uint16_t usb_nrzi_decoder_debug_program_instructions[] = {
+             //     .wrap_target
+-    0xe046, //  0: set    y, 6                       
+-    0x20c4, //  1: wait   1 irq, 4                   
+-    0x0066, //  2: jmp    !y, 6                      
+-    0x00c7, //  3: jmp    pin, 7                     
+-    0x1028, //  4: jmp    !x, 8           side 0     
+-    0x4061, //  5: in     null, 1                    
+-    0xa029, //  6: mov    x, !x                      
++    0xe046, //  0: set    y, 6
++    0x20c4, //  1: wait   1 irq, 4
++    0x0066, //  2: jmp    !y, 6
++    0x00c7, //  3: jmp    pin, 7
++    0x1028, //  4: jmp    !x, 8           side 0
++    0x4061, //  5: in     null, 1
++    0xa029, //  6: mov    x, ~x
+             //     .wrap
+-    0x1825, //  7: jmp    !x, 5           side 1     
+-    0x40e1, //  8: in     osr, 1                     
+-    0x0081, //  9: jmp    y--, 1                     
++    0x1825, //  7: jmp    !x, 5           side 1
++    0x40e1, //  8: in     osr, 1
++    0x0081, //  9: jmp    y--, 1
+ };
+ 
+ #if !PICO_NO_HARDWARE
+-static const struct pio_program usb_nrzi_decoder_debug_program = {
++static __pio_const struct pio_program usb_nrzi_decoder_debug_program = {
+     .instructions = usb_nrzi_decoder_debug_program_instructions,
+     .length = 10,
+     .origin = -1,
++    .pio_version = usb_nrzi_decoder_debug_pio_version,
++#if PICO_PIO_VERSION > 0
++    .used_gpio_ranges = 0x0
++#endif
+ };
+ 
+ static inline pio_sm_config usb_nrzi_decoder_debug_program_get_default_config(uint offset) {
+@@ -196,7 +222,7 @@ static inline void usb_rx_fs_program_init(PIO pio, uint sm, uint offset, uint pi
+   }
+   sm_config_set_in_pins(&c, pin_dp);  // for WAIT, IN
+   sm_config_set_jmp_pin(&c, pin_dp);  // for JMP
+-  // Shift to right, autopush enabled, 8bit
++  // Shift to right, autopull enabled, 8bit
+   sm_config_set_in_shift(&c, true, true, 8);
+   sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+   pio_sm_init(pio, sm, offset, &c);
+@@ -231,3 +257,67 @@ static inline void eop_detect_fs_program_init(PIO pio, uint sm, uint offset,
+ 
+ #endif
+ 
++// ---------- //
++// usb_dev_rx //
++// ---------- //
++
++#define usb_dev_rx_wrap_target 15
++#define usb_dev_rx_wrap 22
++#define usb_dev_rx_pio_version 0
++
++#define usb_dev_rx_offset_start 29u
++
++static __pio_const uint16_t usb_dev_rx_program_instructions[] = {
++    0xa142, //  0: nop                           [1]
++    0xa020, //  1: mov    x, pins
++    0x0024, //  2: jmp    !x, 4
++    0x001b, //  3: jmp    27
++    0x0068, //  4: jmp    !y, 8
++    0x4061, //  5: in     null, 1
++    0xe246, //  6: set    y, 6                   [2]
++    0x000c, //  7: jmp    12
++    0x0006, //  8: jmp    6
++    0x40e1, //  9: in     osr, 1
++    0x008b, // 10: jmp    y--, 11
++    0x0277, // 11: jmp    !y, 23                 [2]
++    0x00d9, // 12: jmp    pin, 25
++    0x4061, // 13: in     null, 1
++    0xe046, // 14: set    y, 6
++            //     .wrap_target
++    0x00c0, // 15: jmp    pin, 0
++    0x00c0, // 16: jmp    pin, 0
++    0x00c0, // 17: jmp    pin, 0
++    0x00c0, // 18: jmp    pin, 0
++    0x00c0, // 19: jmp    pin, 0
++    0x00c0, // 20: jmp    pin, 0
++    0x40e1, // 21: in     osr, 1
++    0x008f, // 22: jmp    y--, 15
++            //     .wrap
++    0x00d9, // 23: jmp    pin, 25
++    0x000e, // 24: jmp    14
++    0xa020, // 25: mov    x, pins
++    0x0029, // 26: jmp    !x, 9
++    0xa0cb, // 27: mov    isr, ~null
++    0x8000, // 28: push   noblock
++    0x00dd, // 29: jmp    pin, 29
++    0xc103, // 30: irq    nowait 3               [1]
++    0x000d, // 31: jmp    13
++};
++
++#if !PICO_NO_HARDWARE
++static __pio_const struct pio_program usb_dev_rx_program = {
++    .instructions = usb_dev_rx_program_instructions,
++    .length = 32,
++    .origin = -1,
++    .pio_version = usb_dev_rx_pio_version,
++#if PICO_PIO_VERSION > 0
++    .used_gpio_ranges = 0x0
++#endif
++};
++
++static inline pio_sm_config usb_dev_rx_program_get_default_config(uint offset) {
++    pio_sm_config c = pio_get_default_sm_config();
++    sm_config_set_wrap(&c, offset + usb_dev_rx_wrap_target, offset + usb_dev_rx_wrap);
++    return c;
++}
++#endif

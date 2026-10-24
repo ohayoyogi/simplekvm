@@ -87,6 +87,11 @@ static void core1_main(void) {
   sleep_ms(10);
   static pio_usb_configuration_t config = PIO_USB_DEFAULT_CONFIG;
   config.pin_dp = PICO_DEFAULT_PIO_USB_DP_PIN;   // GP12, D- = GP13
+  // TX stays on pio0; the device receiver from our Pico-PIO-USB patch
+  // (usb_dev_rx) fills all 32 instructions of a PIO block, so it gets pio1.
+  config.pio_rx_num = 1;
+  config.sm_rx = 0;
+  config.sm_eop = 1;                             // claimed, unused in device mode
   pio_report_desc[PIO_ITF_KEYBOARD] = hid_desc_keyboard;
   pio_report_desc[PIO_ITF_MOUSE] = hid_desc_mouse_combo;
   init_strings();
