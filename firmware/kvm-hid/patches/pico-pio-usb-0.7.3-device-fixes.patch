@@ -1,0 +1,140 @@
+diff --git a/src/pio_usb_device.c b/src/pio_usb_device.c
+index 5057152..14266c9 100644
+--- a/src/pio_usb_device.c
++++ b/src/pio_usb_device.c
+@@ -22,6 +22,7 @@
+ #include "hardware/irq.h"
+ #include "hardware/gpio.h"
+ #include "hardware/pio.h"
++#include "hardware/sync.h"
+ 
+ static uint8_t new_devaddr = 0;
+ static uint8_t ep0_crc5_lut[16];
+@@ -42,11 +43,35 @@ static void __no_inline_not_in_flash_func(update_ep0_crc5_lut)(uint8_t addr) {
+ }
+ 
+ static __always_inline void restart_usb_receiver(pio_port_t *pp) {
++  // drop a leftover bit trigger before the restart (see rearm_receiver_at_eop)
++  pp->pio_usb_rx->irq = 1u << DECODER_TRIGGER;
+   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
+   pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
+   pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+ }
+ 
++// Re-arm the receiver as soon as the current packet's EOP is seen. The edge
++// detector stalls on "irq wait IRQ_RX_EOP" until the CPU clears that flag,
++// and the next packet may start ~4 bit times (~330 ns) after EOP: right after
++// SOF a hub's TT sends the periodic (interrupt) IN tokens. Restart the
++// decoder and release the detector first; the FIFO is cleared afterwards
++// (the next byte needs > 600 ns to arrive).
++static __always_inline void rearm_receiver_at_eop(pio_port_t *pp) {
++  while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
++    continue;
++  }
++  // SM restart does not clear IRQ flags: drop a leftover bit trigger while
++  // the detector is still parked on EOP, or the decoder shifts it in as the
++  // first bit of the next packet (SYNC/PID one bit off). Also put the
++  // decoder back at its first instruction (restart keeps the PC).
++  pp->pio_usb_rx->irq = 1u << DECODER_TRIGGER;
++  pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr);
++  pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
++  pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
++  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
++  pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
++}
++
+ static __always_inline uint8_t device_receive_token(void) {
+   pio_port_t *pp = PIO_USB_PIO_PORT(0);
+   uint8_t idx = 0;
+@@ -135,6 +160,9 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+   if (token == USB_PID_IN) {
+     int8_t ep_num = device_receive_ep_address(token, addr);
+     if (ep_num < 0) {
++      // IN for another device on the same TT: re-arm right at its EOP, or
++      // the packet that follows (often our own IN) is lost
++      rearm_receiver_at_eop(pp);
+       gpio_set_mask(1 << 3);
+       return;
+     }
+@@ -178,8 +206,14 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+         update_ep0_crc5_lut(rport->dev_addr);
+       }
+ 
+-      rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
++      // The next packet is encoded later by pio_usb_device_task(). Until then
++      // answer NAK: leaving has_transfer set would send this packet again and
++      // the pending continue would then skip data (multi-packet transfers
++      // such as a configuration descriptor over 64 bytes broke this way).
+       rport->ep_continue |= (1 << ep_num);
++      __dmb();
++      ep->has_transfer = false;
++      rport->ints |= PIO_USB_INTS_ENDPOINT_CONTINUE_BITS;
+     } else {
+       pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+       irq_clear(pp->device_rx_irq_num);
+@@ -192,8 +226,8 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+     }
+   } else if (token == USB_PID_OUT) {
+     int8_t ep_num = device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
++    // the DATA packet follows the token within a few bit times
++    rearm_receiver_at_eop(pp);
+     if (ep_num < 0) {
+       return;
+     }
+@@ -246,13 +280,10 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+     }
+   } else if (token == USB_PID_SOF) {
+     // SOF interrupt
+-    device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
++    rearm_receiver_at_eop(pp);
+   } else {
+-    device_receive_ep_address(token, addr);
+-    wait_receive_complete(pp);
+-    restart_usb_receiver(pp);
++    // late (packet already over), corrupt or non-token packet
++    rearm_receiver_at_eop(pp);
+   }
+ }
+ 
+@@ -401,7 +432,7 @@ void pio_usb_device_task(void) {
+           (uint8_t *)descriptor_buffers.hid_report[ep0_desc_request_idx],
+           ep0_desc_request_len);
+       ep0_desc_request_type = -1;
+-    }
++    } break;
+     default:
+       break;
+   }
+@@ -428,6 +459,14 @@ void pio_usb_device_task(void) {
+ 
+       // TODO should be reset end, this is reset start only
+       rport->ep_complete = rport->ep_stalled = rport->ep_error = 0;
++      // forget work queued before the reset: a stale continue would complete
++      // the freshly zeroed endpoints and derail the next control transfer
++      rport->ep_continue = 0;
++      rport->ints &= ~(PIO_USB_INTS_ENDPOINT_CONTINUE_BITS |
++                       PIO_USB_INTS_ENDPOINT_COMPLETE_BITS |
++                       PIO_USB_INTS_SETUP_REQ_BITS);
++      ep0_desc_request_type = -1;
++      new_devaddr = 0;
+       rport->ints |= PIO_USB_INTS_RESET_END_BITS;
+       reset = true;
+     }
+@@ -562,7 +601,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+       if (root->ep_continue & (1 << b)) {
+         endpoint_t *ep = PIO_USB_ENDPOINT((b << 1) | 0x01);
+         uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
+-        pio_usb_ll_transfer_continue(ep, xact_len);
++        // the packet handler parked the endpoint; re-arm it once the next
++        // packet is encoded (transfer_continue clears it when complete)
++        if (pio_usb_ll_transfer_continue(ep, xact_len)) {
++          ep->has_transfer = true;
++        }
++        __dmb();
+         root->ep_continue &= ~(1 << b);
+       }
+     }

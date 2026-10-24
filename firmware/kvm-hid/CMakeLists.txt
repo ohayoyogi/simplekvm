@@ -42,11 +42,16 @@ add_subdirectory($ENV{PICO_PIO_USB_PATH} pico_pio_usb)
 add_executable(kvm_hid_cdc ${COMMON_SRC}
     src/cdc/main.c src/cdc/usb_descriptors.c)
 target_include_directories(kvm_hid_cdc PRIVATE src src/cdc)
-target_compile_definitions(kvm_hid_cdc PRIVATE KVM_HID_VERSION="${KVM_HID_VERSION}")
+set(KVM_SYS_KHZ 240000 CACHE STRING "CDC variant system clock (kHz): 120000 or 240000 for PIO-USB")
+target_compile_definitions(kvm_hid_cdc PRIVATE KVM_HID_VERSION="${KVM_HID_VERSION}"
+    KVM_SYS_KHZ=${KVM_SYS_KHZ})
 pico_generate_pio_header(kvm_hid_cdc ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 target_link_libraries(kvm_hid_cdc PRIVATE
     pico_stdlib pico_unique_id pico_multicore hardware_pio
     tinyusb_device tinyusb_board pico_pio_usb)
 pico_enable_stdio_uart(kvm_hid_cdc 1)
 pico_enable_stdio_usb(kvm_hid_cdc 0)
+# PIO-USB answers IN tokens in software within ~1 us; run everything from RAM
+# so a flash (XIP) stall on either core never delays that interrupt.
+pico_set_binary_type(kvm_hid_cdc copy_to_ram)
 pico_add_extra_outputs(kvm_hid_cdc)

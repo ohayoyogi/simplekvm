@@ -30,11 +30,26 @@ Waveshare RP2350-USB-A を、KVM ホスト（Tinker Board）からの 1 行コ�
 bash firmware/kvm-hid/build.sh          # -> firmware/kvm-hid/out/*.uf2
 KVM_UART_BAUD=921600 bash firmware/kvm-hid/build.sh   # UART を速くする場合
 ```
-- Docker イメージ `kvm-hid-pico`（arm-none-eabi-gcc）を使う。pico-sdk 2.3.1 と Pico-PIO-USB 0.7.2 は `~/kvm-hid-build` に取得する。
+- Docker イメージ `kvm-hid-pico`（arm-none-eabi-gcc）を使う。pico-sdk 2.3.1 と Pico-PIO-USB 0.7.3（`patches/` のパッチを当てる）は `~/kvm-hid-build` に取得する。
 - プロトコルとキューのホスト側テスト: `cc -Isrc -o /tmp/t test/test_proto.c src/proto.c src/hid_reports.c && /tmp/t`
 
 ## 書き込み
 BOOT ボタンを押しながら USB-C を PC につなぐ → `RP2350` ドライブに UF2 をコピーする。
+
+CDC 版が動いていれば、ポートを 1200 bps で開くだけで書き込みモードに入る（Pico SDK の stdio_usb と同じ）。Tinker からなら:
+```
+stty -F /dev/ttyACM0 1200          # -> RP2350 ドライブ（/dev/sdX1）が現れる
+sudo mount /dev/sdX1 /mnt && sudo cp kvm_hid_cdc.uf2 /mnt/ && sync && sudo umount /mnt
+```
+
+## Pico-PIO-USB への修正（CDC 版）
+`patches/pico-pio-usb-0.7.3-device-fixes.patch`（build.sh が自動で当てる。`PIOUSB_PATCHED=1` で飛ばす）。デバイスモードの次の不具合を直している。
+- 64 バイトを超える IN 転送: ACK のあと次のパケットを準備するまでの間、前のパケットを送り直してデータが飛んでいた（84 バイトの設定記述子が読めなかった）。準備ができるまで NAK を返す。
+- バスリセットのときに、保留中の「続き」や後回しの記述子の要求を消していなかった。
+- 受信器の再開: エッジ検出器はパケットの EOP で止まり、CPU がフラグを消すまで次のパケットを待たない。次のパケットは EOP の約 330 ns 後に始まりうる（ハブの TT は SOF の直後に割り込み IN を送る）。EOP を見たらすぐ、最小限の書き込みで再開する（SOF、他デバイス宛て、OUT、不明なパケット）。
+- 古いビットトリガー: PIO のリスタートでは IRQ フラグが消えないので、残った `DECODER_TRIGGER` を次のパケットの先頭ビットとして読み、SYNC/PID が 1 ビットずれていた（0.7.3 のホスト側の修正と同じ問題）。先に消してからデコーダを戻す。
+
+あわせて、CDC 版は **240 MHz で動かす**（PIO-USB の受信は 120 MHz か 240 MHz が前提。120 MHz では Tinker のハブ経由でトークンの約 1/3 を読み損ねた）。RP2350 の定格（150 MHz）を超えるオーバークロック。全体を RAM で動かす（`copy_to_ram`）。
 
 ## 動作確認
 1. LED の色:
@@ -63,6 +78,7 @@ RP2350 からは `L xx`（キーボード LED）が返る。CDC 版は Pico-PIO-
 - 両方とも、ビルドとホスト側テストまで（2026-10-21）。実機での列挙、BIOS での動作、PIO-USB の安定性は未確認。
 - CDC 版を実機で試した（2026-10-24）:
   - USB-C 側の CDC は動いた。1200 bps でポートを開くと書き込みモードに入るので、BOOT ボタンなしで書き換えられる。`?` に `OK kvm-hid cdc 0.1` が返る。
-  - **USB-A 側（PIO-USB）の列挙が安定しない**。ボードには D+ のプルアップ（R13 1.5 kΩ）があり、接続は検出される。しかし、設定記述子の全体（84 バイト = 2 パケット）の読み取りがほぼ毎回 STALL（Linux で `unable to read config index 0 descriptor/all`、`error -32`）になる。一度だけ列挙できたが、約 1 秒後にホストがリセットし、そのあと `can't set config #1` で失敗した。Waveshare のデモ（マウス 1 つ、記述子が 64 バイト以内）では起きない種類の問題と見ている。
+  - USB-A 側（PIO-USB）: 素の 0.7.2 / 120 MHz では、84 バイトの設定記述子が読めず、ほぼ列挙できなかった。上記の修正と 240 MHz で、**列挙でき、キー・絶対座標・相対マウスが届く**ようになった。
+  - **ただし、Tinker のハブ（Genesys 05e3:0610、TT 1 個）経由の折り返しでは、まだ安定しない**: 割り込み IN がときどき失敗し（`-71`）、Linux の usbhid がデバイスをリセットする（120 秒で 20 回ほど。測定ごとのばらつきが大きい）。ハブの TT が詰まって `clear tt ... error -110` が出続け、同じハブの機器（RP2350 の CDC 側も）が止まったこともある（コントローラの付け直しで復旧）。PC の USB ポートに直接つなぐ本来の使い方では、TT を通らないので条件が違う（未確認）。
   - プルアップが常にかかっているので、ファームを書き換えても「抜き差し」にならない。ホストのハブが列挙をあきらめていたら、ポートを無効→有効にする（Linux なら `/sys/bus/usb/devices/<hub>:1.0/<hub>-portN/disable` に 1 → 0）か、ケーブルを抜き差しする。
 - WS2812 の色の並び（GRB を仮定）。

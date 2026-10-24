@@ -15,9 +15,12 @@
 #include "class/hid/hid.h"   // HID constants (TinyUSB's HID class is not built here)
 #include "hardware/clocks.h"
 #include "led.h"
+#include "pico/bootrom.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
+#include "hardware/sync.h"
 #include "pio_usb.h"
+#include "pio_usb_ll.h"
 #include "tusb.h"
 
 // ---- PIO-USB HID device (USB-A) -------------------------------------------
@@ -103,6 +106,10 @@ static void pump_hid(void) {
     if (!r) continue;
     endpoint_t *ep = pio_usb_get_endpoint(dev, (uint8_t)(itf + 1));
     if (!ep || ep->has_transfer) continue;
+    // With patches/pico-pio-usb-*-device-continue.patch the endpoint is idle
+    // but still owned by core1 while its last packet's continue is pending.
+    __dmb();
+    if (PIO_USB_ROOT_PORT(0)->ep_continue & (1u << (itf + 1))) continue;
     memcpy(ep_buf[itf], r, bridge_q[itf].size);
     if (pio_usb_set_out_data(ep, ep_buf[itf], bridge_q[itf].size) == 0) hidq_pop(&bridge_q[itf]);
   }
@@ -118,9 +125,20 @@ void bridge_reply(const char *s) {
   tud_cdc_write_flush();
 }
 
+// Opening the port at 1200 baud reboots into the USB bootloader (like the
+// Pico SDK's stdio_usb), so the host can reflash without the BOOT button:
+//   stty -F /dev/ttyACM0 1200
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *coding) {
+  (void)itf;
+  if (coding->bit_rate == 1200) reset_usb_boot(0, 0);
+}
+
 int main(void) {
-  // PIO-USB needs a system clock that is a multiple of 12 MHz
-  set_sys_clock_khz(120000, true);
+  // PIO-USB's receiver is timed for 120 or 240 MHz. At 120 MHz, behind the
+  // Tinker Board's hub, it misread ~1/3 of the tokens and every interrupt IN
+  // failed; at 240 MHz the device stays up (an overclock: RP2350 is rated
+  // for 150 MHz, but 240 MHz is the usual setting for PIO-USB).
+  set_sys_clock_khz(KVM_SYS_KHZ, true);
   stdio_uart_init();          // UART0 (GP0/GP1) carries debug printf only
 
   bridge_init();
