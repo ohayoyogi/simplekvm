@@ -14,7 +14,7 @@ index 30a87d3..353a867 100644
  int pio_usb_set_out_data(endpoint_t *ep, const uint8_t *buffer, uint8_t len);
  
 diff --git a/src/pio_usb_device.c b/src/pio_usb_device.c
-index 5057152..f0a5375 100644
+index 5057152..6c0cecf 100644
 --- a/src/pio_usb_device.c
 +++ b/src/pio_usb_device.c
 @@ -22,8 +22,16 @@
@@ -514,7 +514,24 @@ index 5057152..f0a5375 100644
  
    return dev;
  }
-@@ -401,7 +429,7 @@ void pio_usb_device_task(void) {
+@@ -374,6 +402,16 @@ static void __no_inline_not_in_flash_func(prepare_ep0_rx)(uint8_t *data,
+   }
+ }
+ 
++// Bus reset detection. Not pio_usb_bus_get_line_state(): on RP2350 rev A2 it
++// briefly disables the D+/D- input buffers (RP2350-E9 workaround for weakly
++// pulled pins), which the receiver sees as SE0. Called in a busy loop, that
++// broke the start of packets arriving while the CPU was idle (mostly SOF).
++// The bus here is driven, so plain reads are fine. Inputs are inverted:
++// SE0 reads as 1 on both pins.
++static __always_inline bool line_is_se0(root_port_t *rport) {
++  return gpio_get(rport->pin_dp) && gpio_get(rport->pin_dm);
++}
++
+ void pio_usb_device_task(void) {
+   root_port_t *rport = PIO_USB_ROOT_PORT(0);
+   pio_port_t *pp = PIO_USB_PIO_PORT(0);
+@@ -401,14 +439,14 @@ void pio_usb_device_task(void) {
            (uint8_t *)descriptor_buffers.hid_report[ep0_desc_request_idx],
            ep0_desc_request_len);
        ep0_desc_request_type = -1;
@@ -523,7 +540,15 @@ index 5057152..f0a5375 100644
      default:
        break;
    }
-@@ -428,14 +456,21 @@ void pio_usb_device_task(void) {
+ 
+   uint32_t se0_time_us =0;
+   bool reset = false;
+-  while (pio_usb_bus_get_line_state(rport) == PORT_PIN_SE0) {
++  while (line_is_se0(rport)) {
+     busy_wait_us_32(1);
+     se0_time_us++;
+ 
+@@ -428,14 +466,21 @@ void pio_usb_device_task(void) {
  
        // TODO should be reset end, this is reset start only
        rport->ep_complete = rport->ep_stalled = rport->ep_error = 0;
@@ -548,7 +573,7 @@ index 5057152..f0a5375 100644
    }
  }
  
-@@ -503,9 +538,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
+@@ -503,9 +548,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
        res = 0;
      } else if (packet->request == 0x0B) {
        // set hid protocol request
@@ -575,7 +600,7 @@ index 5057152..f0a5375 100644
    } else if (packet->request_type == (USB_REQ_REC_EP)) {
        prepare_ep0_data(NULL, 0);
        res = 0;
-@@ -562,7 +614,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+@@ -562,7 +624,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
        if (root->ep_continue & (1 << b)) {
          endpoint_t *ep = PIO_USB_ENDPOINT((b << 1) | 0x01);
          uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);

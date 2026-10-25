@@ -42,23 +42,28 @@ static const tusb_desc_device_t pio_desc_device = {
     .bNumConfigurations = 1,
 };
 
-// Two interfaces only, polled at 8 / 4 ms: PIO-USB receives in software and
-// every IN token is work for it (three 1 ms interfaces meant three tokens
-// back to back after each SOF). Both pointers share the boot mouse.
-enum { PIO_ITF_KEYBOARD = 0, PIO_ITF_MOUSE, PIO_ITF_COUNT };
-#define PIO_EP_KEYBOARD 1
-#define PIO_EP_MOUSE 2
+// Keyboard, absolute mouse and relative (boot) mouse as separate interfaces:
+// in one interface Linux maps the second pointer's buttons and wheel to
+// nothing (duplicate usages). Polled every 8 / 4 / 4 ms (1 ms buys nothing
+// next to the video latency, and every IN token is work for PIO-USB).
+enum { PIO_ITF_KEYBOARD = 0, PIO_ITF_MOUSE_ABS, PIO_ITF_MOUSE_REL, PIO_ITF_COUNT };
+#define PIO_EP(itf) ((itf) + 1)
 #define PIO_CONFIG_LEN (TUD_CONFIG_DESC_LEN + PIO_ITF_COUNT * TUD_HID_DESC_LEN)
 #define PIO_EP_SIZE 16
 
 static const uint8_t pio_desc_config[] = {
     TUD_CONFIG_DESCRIPTOR(1, PIO_ITF_COUNT, 0, PIO_CONFIG_LEN, 0, 100),
     TUD_HID_DESCRIPTOR(PIO_ITF_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD, HID_DESC_KEYBOARD_LEN,
-                       0x80 | PIO_EP_KEYBOARD, PIO_EP_SIZE, 8),
-    TUD_HID_DESCRIPTOR(PIO_ITF_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE, HID_DESC_MOUSE_COMBO_LEN,
-                       0x80 | PIO_EP_MOUSE, PIO_EP_SIZE, 4),
+                       0x80 | PIO_EP(PIO_ITF_KEYBOARD), PIO_EP_SIZE, 8),
+    TUD_HID_DESCRIPTOR(PIO_ITF_MOUSE_ABS, 0, HID_ITF_PROTOCOL_NONE, HID_DESC_MOUSE_ABS_LEN,
+                       0x80 | PIO_EP(PIO_ITF_MOUSE_ABS), PIO_EP_SIZE, 4),
+    TUD_HID_DESCRIPTOR(PIO_ITF_MOUSE_REL, 0, HID_ITF_PROTOCOL_MOUSE, HID_DESC_MOUSE_REL_LEN,
+                       0x80 | PIO_EP(PIO_ITF_MOUSE_REL), PIO_EP_SIZE, 4),
 };
-_Static_assert(sizeof(pio_desc_config) <= 64, "configuration descriptor fits one packet");
+_Static_assert((int)PIO_ITF_KEYBOARD == (int)HID_ITF_KEYBOARD &&
+                   (int)PIO_ITF_MOUSE_ABS == (int)HID_ITF_MOUSE_ABS &&
+                   (int)PIO_ITF_MOUSE_REL == (int)HID_ITF_MOUSE_REL,
+               "interfaces in bridge_q order");
 
 static const uint8_t *pio_report_desc[PIO_ITF_COUNT];
 static const char *const pio_strings[] = {
@@ -93,7 +98,8 @@ static void core1_main(void) {
   config.sm_rx = 0;
   config.sm_eop = 1;                             // claimed, unused in device mode
   pio_report_desc[PIO_ITF_KEYBOARD] = hid_desc_keyboard;
-  pio_report_desc[PIO_ITF_MOUSE] = hid_desc_mouse_combo;
+  pio_report_desc[PIO_ITF_MOUSE_ABS] = hid_desc_mouse_abs;
+  pio_report_desc[PIO_ITF_MOUSE_REL] = hid_desc_mouse_rel;
   init_strings();
   pio_desc.device = (const uint8_t *)&pio_desc_device;
   pio_desc.config = pio_desc_config;
@@ -106,7 +112,6 @@ static void core1_main(void) {
 // Reports must stay valid until the PIO transfer completes, so each endpoint
 // has its own buffer that is only rewritten when the endpoint is idle.
 static uint8_t ep_buf[PIO_ITF_COUNT][8];
-static bool mouse_rel_turn;   // both pointer queues pending: alternate
 
 // Keepalive: while idle, send the current state again every KEEPALIVE_MS.
 // Linux's usbhid leaves its retry state only on a report with data; an idle
@@ -127,14 +132,10 @@ static bool send_report(endpoint_t *ep, uint8_t itf, const uint8_t *data, uint8_
   if (pio_usb_set_out_data(ep, ep_buf[itf], len) != 0) return false;
   uint8_t *idle = idle_rep[itf];
   memcpy(idle, data, len);
-  if (itf == PIO_ITF_MOUSE) {
-    if (len == 3) {                              // boot: buttons, x, y
-      idle[1] = idle[2] = 0;
-    } else if (idle[0] == REPORT_ID_REL) {       // buttons, x, y, wheel, pan
-      memset(idle + 2, 0, (size_t)len - 2);
-    } else {                                     // abs: keep position, no wheel
-      idle[len - 1] = 0;
-    }
+  if (itf == PIO_ITF_MOUSE_REL) {
+    memset(idle + 1, 0, (size_t)len - 1);        // buttons only: no motion, wheel, pan
+  } else if (itf == PIO_ITF_MOUSE_ABS) {
+    idle[len - 1] = 0;                           // keep the position, no wheel
   }
   idle_len[itf] = len;
   idle_proto[itf] = pio_usb_device_hid_protocol[itf];
@@ -166,39 +167,19 @@ static void pump_hid(void) {
   if (!dev) return;
   endpoint_t *ep;
 
-  hidq_t *q = &bridge_q[HID_ITF_KEYBOARD];
-  const uint8_t *r = hidq_peek(q);
-  if ((ep = idle_endpoint(dev, PIO_EP_KEYBOARD))) {
-    if (!r) keepalive(ep, PIO_ITF_KEYBOARD);
-    else if (send_report(ep, PIO_ITF_KEYBOARD, r, sizeof(kbd_report_t))) hidq_pop(q);
+  for (uint8_t itf = 0; itf < PIO_ITF_COUNT; itf++) {
+    if (!(ep = idle_endpoint(dev, PIO_EP(itf)))) continue;
+    hidq_t *q = &bridge_q[itf];
+    const uint8_t *r = hidq_peek(q);
+    if (!r) {
+      keepalive(ep, itf);
+      continue;
+    }
+    // A BIOS selects the boot protocol: the relative mouse then sends only
+    // the 3-byte boot report (buttons, x, y).
+    uint8_t len = (itf == PIO_ITF_MOUSE_REL && pio_usb_device_hid_protocol[itf] == 0) ? 3 : q->size;
+    if (send_report(ep, itf, r, len)) hidq_pop(q);
   }
-
-  if (!(ep = idle_endpoint(dev, PIO_EP_MOUSE))) return;
-  hidq_t *qa = &bridge_q[HID_ITF_MOUSE_ABS], *qr = &bridge_q[HID_ITF_MOUSE_REL];
-  bool has_a = hidq_peek(qa) != NULL, has_r = hidq_peek(qr) != NULL;
-  if (!(has_a || has_r)) {
-    keepalive(ep, PIO_ITF_MOUSE);
-    return;
-  }
-  q = (has_r && (mouse_rel_turn || !has_a)) ? qr : qa;
-  mouse_rel_turn = q != qr;
-  r = hidq_peek(q);
-  uint8_t b[8];
-  uint8_t len;
-  if (pio_usb_device_hid_protocol[PIO_ITF_MOUSE] == 0) {
-    // boot protocol (BIOS/UEFI): 3-byte relative report; absolute input
-    // can only pass its buttons
-    bool rel = q == qr;
-    b[0] = rel ? ((const rel_report_t *)r)->buttons : ((const abs_report_t *)r)->buttons;
-    b[1] = rel ? (uint8_t)((const rel_report_t *)r)->x : 0;
-    b[2] = rel ? (uint8_t)((const rel_report_t *)r)->y : 0;
-    len = 3;
-  } else {
-    b[0] = q == qr ? REPORT_ID_REL : REPORT_ID_ABS;
-    memcpy(b + 1, r, q->size);
-    len = (uint8_t)(q->size + 1);
-  }
-  if (send_report(ep, PIO_ITF_MOUSE, b, len)) hidq_pop(q);
 }
 
 // ---- CDC link to the KVM host (native USB-C) ------------------------------

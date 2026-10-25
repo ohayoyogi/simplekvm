@@ -35,14 +35,6 @@ extern const uint16_t hid_desc_mouse_abs_len;
 extern const uint8_t hid_desc_mouse_rel[];
 extern const uint16_t hid_desc_mouse_rel_len;
 
-// CDC variant: one boot-mouse interface carries both pointers. In report
-// protocol it sends [REPORT_ID_REL, rel_report_t] or [REPORT_ID_ABS,
-// abs_report_t]; in boot protocol (BIOS) the 3-byte boot report.
-#define REPORT_ID_REL 1
-#define REPORT_ID_ABS 2
-#define HID_DESC_MOUSE_COMBO_LEN 135
-extern const uint8_t hid_desc_mouse_combo[];
-
 // Small per-interface queues. Reports are state snapshots, so when a queue is
 // full the newest entry is overwritten (the final state is never lost);
 // relative motion is merged instead so no movement is dropped.
