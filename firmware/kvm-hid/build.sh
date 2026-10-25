@@ -14,7 +14,7 @@ SDK_TAG=${SDK_TAG:-2.3.1}
 PIOUSB_TAG=${PIOUSB_TAG:-0.7.3}
 IMG=kvm-hid-pico
 BAUD=${KVM_UART_BAUD:-115200}
-SYS_KHZ=${KVM_SYS_KHZ:-240000}
+SYS_KHZ=${KVM_SYS_KHZ:-120000}
 
 mkdir -p "$WORK"
 if ! docker image inspect $IMG >/dev/null 2>&1; then

@@ -201,10 +201,9 @@ void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *coding) {
 }
 
 int main(void) {
-  // PIO-USB's receiver is timed for 120 or 240 MHz. At 120 MHz, behind the
-  // Tinker Board's hub, it misread ~1/3 of the tokens and every interrupt IN
-  // failed; at 240 MHz the device stays up (an overclock: RP2350 is rated
-  // for 150 MHz, but 240 MHz is the usual setting for PIO-USB).
+  // PIO-USB needs 120 or 240 MHz (TX at clk_sys / 48 MHz, our receiver at
+  // clk_sys / 96 MHz). 120 MHz is within the RP2350's rating; the stock
+  // receiver needed 240 MHz to re-arm in time, usb_dev_rx does not.
   set_sys_clock_khz(KVM_SYS_KHZ, true);
   stdio_uart_init();          // UART0 (GP0/GP1) carries debug printf only
 

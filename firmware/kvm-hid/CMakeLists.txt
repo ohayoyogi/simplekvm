@@ -42,7 +42,7 @@ add_subdirectory($ENV{PICO_PIO_USB_PATH} pico_pio_usb)
 add_executable(kvm_hid_cdc ${COMMON_SRC}
     src/cdc/main.c src/cdc/usb_descriptors.c)
 target_include_directories(kvm_hid_cdc PRIVATE src src/cdc)
-set(KVM_SYS_KHZ 240000 CACHE STRING "CDC variant system clock (kHz): 120000 or 240000 for PIO-USB")
+set(KVM_SYS_KHZ 120000 CACHE STRING "CDC variant system clock (kHz): 120000 or 240000 for PIO-USB")
 target_compile_definitions(kvm_hid_cdc PRIVATE KVM_HID_VERSION="${KVM_HID_VERSION}"
     KVM_SYS_KHZ=${KVM_SYS_KHZ})
 pico_generate_pio_header(kvm_hid_cdc ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)

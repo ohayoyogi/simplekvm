@@ -54,7 +54,7 @@ sudo mount /dev/sdX1 /mnt && sudo cp kvm_hid_cdc.uf2 /mnt/ && sync && sudo umoun
 - **バスリセットの見張りが受信を壊していた**: `pio_usb_bus_get_line_state()` は RP2350 で、E9 の不具合への対処として D+/D− の入力を一瞬無効にする。受信器からは偽の SE0 に見える。メインループで休みなく呼ばれていたので、CPU が待機中に届いたパケット（主に SOF）の先頭が壊れていた。デバイスモードでは入力を切り替えずに読む（USB の線は駆動されているので E9 の対処は不要）。
 - HID のプロトコル: SET_PROTOCOL の値をインターフェースごとに `pio_usb_device_hid_protocol[]` に記録する（ブートプロトコルなら 3 バイトのレポートを送るため）。GET_PROTOCOL と GET_IDLE に答える（以前は応答せず、ホストがタイムアウトしていた）。
 
-あわせて、CDC 版は **240 MHz で動かす**（PIO-USB の受信は 120 MHz か 240 MHz が前提。120 MHz では Tinker のハブ経由でトークンの約 1/3 を読み損ねた）。RP2350 の定格（150 MHz）を超えるオーバークロック。全体を RAM で動かす（`copy_to_ram`）。
+あわせて、CDC 版は **120 MHz**（RP2350 の定格内。PIO-USB は 120 MHz か 240 MHz が前提）で動かし、全体を RAM で動かす（`copy_to_ram`）。元の受信器は CPU が急いで再開させる必要があり、120 MHz ではトークンの約 1/3 を読み損ねたので一時 240 MHz にしていたが、`usb_dev_rx` は CPU を待たないので 120 MHz で足りる（折り返しで 120 秒、エラー 0）。`KVM_SYS_KHZ=240000` で 240 MHz にもできる。
 
 ## 動作確認
 1. LED の色:
