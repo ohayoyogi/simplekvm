@@ -761,16 +761,38 @@ class Csi:
         m = re.search(r"fmt:\S+?/(\d+)x(\d+)", self._mc("--get-v4l2", '"%s":%d' % (entity, pad)))
         return (int(m.group(1)), int(m.group(2))) if m else None
 
+    @staticmethod
+    def _edid_bytes(text, fix=False):
+        """EDID hex text (any spacing) -> bytes; fix: checksum of each block."""
+        b = bytearray.fromhex(re.sub(r"[^0-9a-fA-F]", "", text))
+        for s in range(0, len(b) - 127, 128) if fix else ():
+            b[s + 127] = -sum(b[s:s + 127]) & 0xFF
+        return bytes(b)
+
+    def _load_edid(self):
+        """Write the EDID unless the same one is loaded already (at boot by
+        rk3288-mainline-media's tc358743-edid, or by an earlier run): every
+        write drops HDMI hot-plug detect, and the source re-detects the
+        "monitor". Without a file, keep any EDID that is there."""
+        cur = self._ctl("--get-edid=pad=0,format=hex")
+        cur = self._edid_bytes(cur.stdout) if cur.returncode == 0 else b""
+        if self.edid and os.path.exists(self.edid):
+            with open(self.edid) as f:
+                if cur == self._edid_bytes(f.read(), fix=True):
+                    return True
+            r = self._ctl("--set-edid=pad=0,file=%s" % self.edid, "--fix-edid-checksums")
+        elif cur:
+            return True
+        else:
+            r = self._ctl("--set-edid=pad=0,type=hdmi")
+        time.sleep(1)                   # the source reacts to the hot-plug
+        return r.returncode == 0
+
     def hdmi_timings(self):
         """TC358743: load the EDID once, lock onto the incoming timings and
         return the active size, or None without a signal."""
         if not self.edid_set:
-            if self.edid and os.path.exists(self.edid):
-                r = self._ctl("--set-edid=pad=0,file=%s" % self.edid, "--fix-edid-checksums")
-            else:
-                r = self._ctl("--set-edid=pad=0,type=hdmi")
-            self.edid_set = r.returncode == 0
-            time.sleep(1)               # the source reacts to the hot-plug
+            self.edid_set = self._load_edid()
         r = self._ctl("--query-dv-timings")
         w = re.search(r"Active width: (\d+)", r.stdout)
         h = re.search(r"Active height: (\d+)", r.stdout)

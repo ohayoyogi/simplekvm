@@ -73,7 +73,7 @@ Useful options (`python3 kvm.py --help` for all):
 | `--width/--height` | output size (CSI: scaled by the ISP) |
 | `--fps`, `--qp`, `--bitrate`, `--keyint` | encoder settings |
 | `--hid auto\|gadget\|none\|TTY` | RP2350 bridge or USB gadget (`auto`: the CDC firmware, else the gadget if set up) |
-| `--csi-edid FILE` | EDID for the TC358743 (e.g. one that offers 1080p50) |
+| `--csi-edid FILE` | EDID for the TC358743 (e.g. one that offers 1080p50); not rewritten if already loaded, e.g. at boot by `tinker-camera.sh boot-edid on` |
 | `--fb-echo /dev/fb0` | loopback latency test: draw browser clicks on the board's screen |
 | `--idle-stop SEC` | stop capture/encoding when nobody watches (`-1` = never) |
 | `--gst-dir DIR` | where the patched GStreamer plugin is (`~/h264enc/gst`) |
