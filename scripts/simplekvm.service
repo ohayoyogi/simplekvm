@@ -4,8 +4,10 @@
 [Unit]
 Description=simplekvm (LAN KVM: kvm.py)
 Documentation=file:@DIR@/README.md
-Wants=network-online.target
-After=network-online.target
+# kvm.py listens on all addresses, so it does not wait for network-online:
+# with an unplugged Ethernet port systemd-networkd-wait-online holds that
+# for 2 minutes
+After=network.target
 
 [Service]
 Type=simple
