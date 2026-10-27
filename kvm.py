@@ -238,10 +238,14 @@ class FbEcho:
             raise RuntimeError("%s: only 32 bpp supported (got %d)" % (path, bpp))
         self.fd = os.open(path, os.O_RDWR)
         self.mem = mmap.mmap(self.fd, self.stride * self.h)
-        self.sx, self.sy = self.w / src_w, self.h / src_h
+        self.set_source(src_w, src_h)
         self.n = 0
         self.last = None
         log("fb echo on %s (%dx%d)" % (path, self.w, self.h))
+
+    def set_source(self, src_w, src_h):
+        """Size of the stream the browser's coordinates refer to."""
+        self.sx, self.sy = self.w / src_w, self.h / src_h
 
     def rect(self, x, y, w, h, rgb):
         x0, y0 = max(0, int(x)), max(0, int(y))
@@ -726,6 +730,8 @@ class Csi:
         self.kind = self.sensor.split()[0]
         self.subdev = self._mc("-e", self.sensor).strip()
         self.size = None                # (w, h) the encoder was set up for
+        self.src = None                 # (w, h) of the source when last configured
+        self.follow = False             # output follows the HDMI source's size
 
     @staticmethod
     def find():
@@ -788,18 +794,36 @@ class Csi:
         time.sleep(1)                   # the source reacts to the hot-plug
         return r.returncode == 0
 
-    def hdmi_timings(self):
-        """TC358743: load the EDID once, lock onto the incoming timings and
-        return the active size, or None without a signal."""
-        if not self.edid_set:
-            self.edid_set = self._load_edid()
+    def query(self):
+        """TC358743: active size of the incoming HDMI signal, or None without
+        one. Read-only, safe while streaming."""
         r = self._ctl("--query-dv-timings")
         w = re.search(r"Active width: (\d+)", r.stdout)
         h = re.search(r"Active height: (\d+)", r.stdout)
         if r.returncode or not w or not h:
             return None
-        self._ctl("--set-dv-bt-timings", "query")
         return int(w.group(1)), int(h.group(1))
+
+    def hdmi_timings(self):
+        """TC358743: load the EDID once, lock onto the incoming timings and
+        return the active size, or None without a signal."""
+        if not self.edid_set:
+            self.edid_set = self._load_edid()
+        size = self.query()
+        if size is not None:
+            self._ctl("--set-dv-bt-timings", "query")
+        return size
+
+    MAX_OUT = (1920, 1080)              # H1 encoder limit (1920x1088 in macroblocks)
+
+    @classmethod
+    def fit(cls, w, h):
+        """Scale down to the encoder's limit, keeping the aspect ratio."""
+        mw, mh = cls.MAX_OUT
+        if w > mw or h > mh:
+            s = min(mw / w, mh / h)
+            w, h = int(w * s), int(h * s)
+        return w & ~1, h & ~1
 
     def configure(self, width, height, out=None):
         """Program the pipeline; width/height 0 = the sensor's / source's size.
@@ -810,8 +834,9 @@ class Csi:
             code = "UYVY8_1X16"
             size = self.hdmi_timings()
             if size is None:
-                log("csi: no HDMI signal yet, assuming", "%dx%d" % (width or 1280, height or 720))
-                size = (width or 1280, height or 720)
+                # keep the last mode, so a lost signal does not resize the stream
+                size = self.src or (width or 1280, height or 720)
+                log("csi: no HDMI signal, assuming", "%dx%d" % size)
         else:
             code = "SBGGR10_1X10"       # RAW10, the ISP demosaics
             size = (width or 1296, height or 972)   # 1296x972 = 2x2 binned, full view
@@ -822,7 +847,12 @@ class Csi:
         self._set("rkisp1_isp", 0, "fmt:%s/%dx%d %s" % (code, sw, sh, crop))
         self._set("rkisp1_isp", 2, "fmt:YUYV8_2X8/%dx%d %s" % (sw, sh, crop))
         self._set("rkisp1_resizer_mainpath", 0, "fmt:YUYV8_2X8/%dx%d %s" % (sw, sh, crop))
-        ow, oh = out or ((width or sw) & ~1, (height or sh) & ~1)
+        if out:
+            ow, oh = out
+        elif width or height:
+            ow, oh = (width or sw) & ~1, (height or sh) & ~1
+        else:
+            ow, oh = self.fit(sw, sh)
         # 4:2:0 out of the resizer, so the main path can write NV12
         self._set("rkisp1_resizer_mainpath", 1, "fmt:YUYV8_1_5X8/%dx%d" % (ow, oh))
         if self.kind == "ov5647":
@@ -830,15 +860,17 @@ class Csi:
             self._ctl("-c", "auto_exposure=0", "-c", "gain_automatic=1",
                       "-c", "white_balance_automatic=1")
         self.size = (ow, oh)
+        self.src = (sw, sh)
         log("csi: %s %dx%d -> %dx%d NV12 on %s" % (self.sensor, sw, sh, ow, oh, self.video))
         return ow, oh
 
     def prepare(self):
         """Before each GStreamer start: program the graph again, so whatever
         changed it in between (another tool, an HDMI mode change) cannot
-        leave the main path refusing to stream (EPIPE). A new HDMI mode is
-        scaled to the stream size."""
-        self.configure(self.req[0], self.req[1], out=self.size)
+        leave the main path refusing to stream (EPIPE). With follow, the
+        stream takes a new HDMI mode's size; otherwise it is scaled to the
+        size the stream started with."""
+        self.configure(self.req[0], self.req[1], out=None if self.follow else self.size)
 
 
 # --------------------------------------------------------------------------
@@ -863,6 +895,8 @@ class Encoder:
         self.started = 0.0           # when the current process was started
         self.fails = 0               # consecutive runs that died within FAIL_SEC
         self.retry_at = None         # back-off: do not restart before this time
+        self.size = csi.size if csi is not None else None   # CSI stream size
+        self.on_size = None          # called with (w, h) when it changes
 
     FAIL_SEC = 5.0                   # a run shorter than this counts as a failure
 
@@ -890,7 +924,7 @@ class Encoder:
             src = ["v4l2src", "device=%s" % self.csi.video, "io-mode=mmap",
                    "do-timestamp=true", "!",
                    "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1"
-                   % (a.width, a.height, a.fps), "!"] + leaky
+                   % (self.csi.size + (a.fps,)), "!"] + leaky
         elif a.source == "capture":
             # UVC MJPEG -> CPU jpegdec -> VPU. This capture stick sends a few
             # full-size (1080p) JPEGs before switching to the requested size,
@@ -922,7 +956,7 @@ class Encoder:
                 "udpsink", "host=127.0.0.1", "port=%d" % RTP_PORT,
                 "sync=false", "async=false"]
 
-    def start(self):
+    def start(self, prepare=True):
         env = dict(os.environ)
         gst = os.path.expanduser(self.args.gst_dir)
         if os.path.isdir(gst):
@@ -933,11 +967,12 @@ class Encoder:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
             self.sock.bind(("127.0.0.1", RTP_PORT))
             threading.Thread(target=self._rtp_loop, daemon=True).start()
-        if self.csi is not None:
+        if self.csi is not None and prepare:
             try:
                 self.csi.prepare()
             except (OSError, RuntimeError, subprocess.SubprocessError) as e:
                 log("csi:", e)
+        self._check_size()
         cmd = self.gst_cmd()
         log("encoder:", " ".join(cmd))
         self.ts0 = None
@@ -1016,6 +1051,36 @@ class Encoder:
             return True
         except BrokenPipeError:
             return False
+
+    def restart(self, before=None):
+        """Stop GStreamer if it runs, call before() (e.g. reprogram the
+        graph), and start it again if someone is watching."""
+        with self.lock:
+            p = self.proc
+            if p is not None and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+            if before is not None:
+                try:
+                    before()
+                except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+                    log("csi:", e)
+                self._check_size()
+            self.fails, self.retry_at = 0, None
+            if self.wanted and not self.stopping:
+                self.start(prepare=before is None)
+
+    def _check_size(self):
+        """Tell the KVM (and through it the browsers) when the CSI stream
+        size changed, e.g. after an HDMI mode change."""
+        if self.csi is not None and self.csi.size != self.size:
+            self.size = self.csi.size
+            if self.on_size is not None:
+                self.on_size(*self.size)
 
     def stop(self):
         self.stopping = True
@@ -1159,6 +1224,7 @@ class KVM:
         self.clients = set()
         self.clients_lock = threading.Lock()
         self.encoder = Encoder(args, self.on_au, csi)
+        self.encoder.on_size = self.on_size
         self.idle_timer = None
         self.stats = collections.deque(maxlen=self.args.fps * 2)
 
@@ -1192,7 +1258,10 @@ class KVM:
             self.inputs.put(ev)          # test screen / fb echo
 
     def on_hid_status(self, status):
-        msg = json.dumps(dict(status, t="hid")).encode()
+        self.broadcast(dict(status, t="hid"))
+
+    def broadcast(self, obj):
+        msg = json.dumps(obj).encode()
         with self.clients_lock:
             clients = list(self.clients)
         for c in clients:
@@ -1200,6 +1269,57 @@ class KVM:
                 c.send(msg, opcode=1)
             except OSError:
                 pass
+
+    # HDMI source (TC358743) ----------------------------------------------------
+    def on_size(self, w, h):
+        """The stream size changed: mouse coordinates and the fb echo follow,
+        and every browser drops what it still has queued, resizes its canvas
+        and waits for the next key frame."""
+        self.args.width, self.args.height = w, h
+        if self.fb is not None:
+            self.fb.set_source(w, h)
+        log("stream size %dx%d" % (w, h))
+        with self.clients_lock:
+            for c in self.clients:
+                c.need_key = True
+                with c.q.mutex:
+                    c.q.queue.clear()
+        self.broadcast({"t": "size", "w": w, "h": h})
+
+    def watch_source(self, period=1.0):
+        """Poll the HDMI input. A new mode (seen twice in a row, so a mode
+        switch in progress is not caught half way) reprograms the graph and
+        restarts GStreamer; a returning signal restarts a stalled encoder
+        without waiting for the watchdog's back-off."""
+        csi, lost, seen = self.csi, False, None
+        while True:
+            time.sleep(period)
+            try:
+                cur = csi.query()
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if cur is None:
+                if not lost:
+                    lost = True
+                    log("csi: HDMI signal lost")
+                    self.broadcast({"t": "signal", "ok": False})
+                continue
+            if lost:
+                lost = False
+                log("csi: HDMI signal %dx%d" % cur)
+                self.broadcast({"t": "signal", "ok": True})
+                if cur == csi.src and time.monotonic() - self.encoder.last_au > 2:
+                    self.encoder.restart(before=csi.prepare)
+                    continue
+            if cur == csi.src:
+                seen = None
+                continue
+            if cur != seen:
+                seen = cur
+                continue
+            seen = None
+            log("csi: HDMI mode %dx%d -> %dx%d" % (csi.src + cur))
+            self.encoder.restart(before=csi.prepare)
 
     # render loop -------------------------------------------------------------
     def run(self):
@@ -1240,6 +1360,8 @@ class KVM:
         """Video comes straight from the capture stick; input only goes to the
         (optional) framebuffer echo until a HID sink exists."""
         threading.Thread(target=self.encoder.watchdog, daemon=True).start()
+        if self.csi is not None and self.csi.kind == "tc358743":
+            threading.Thread(target=self.watch_source, daemon=True).start()
         while True:
             ev = self.inputs.get()
             if self.fb:
@@ -1288,6 +1410,7 @@ class KVM:
             self.remove_client(c)
             raise
         c.send(json.dumps({"t": "hello", "source": self.args.source,
+                           "w": self.args.width, "h": self.args.height,
                            "sensor": self.csi.sensor if self.csi else "",
                            "fbEcho": bool(self.fb),
                            "hid": self.hid.status() if self.hid else None}).encode(), opcode=1)
@@ -1353,7 +1476,7 @@ PAGE = r"""<!doctype html>
   <span>クリック→表示 <b id="lat">-</b> ms（平均 <b id="lavg">-</b>）</span>
   <span>エンコード <b id="enc">-</b> ms</span>
   <span>フレーム <b id="fno">-</b></span>
-  <span>__W__x__H__ <button id="scale" type="button">等倍</button></span>
+  <span><span id="size">__W__x__H__</span> <button id="scale" type="button">等倍</button></span>
   <span id="err"></span>
 </div>
 <div id="bar2">
@@ -1371,7 +1494,8 @@ PAGE = r"""<!doctype html>
 </div>
 <div id="wrap" class="fit"><canvas id="c" width="__W__" height="__H__"></canvas></div>
 <script>
-const W = __W__, H = __H__, FPS = __FPS__;
+let W = __W__, H = __H__;            // stream size; changes with the HDMI mode
+const FPS = __FPS__;
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 
 // Display scale: "fit" shrinks to the window, "1:1" maps each video pixel to
@@ -1474,7 +1598,13 @@ function connect() {
     if (typeof e.data !== 'string') return onVideo(e.data);
     const m = JSON.parse(e.data);
     if (m.t === 'hid') return onHid(m);
+    if (m.t === 'size') return setSize(m.w, m.h);
+    if (m.t === 'signal') {
+      $('st').textContent = m.ok ? '信号あり（キーフレーム待ち）' : 'HDMI 信号なし';
+      return;
+    }
     if (m.t === 'hello') {
+      setSize(m.w, m.h);
       onHid(m.hid);
       source = m.source;
       const echo = m.fbEcho ? '（クリックを HDMI に描画）' : '';
@@ -1483,6 +1613,19 @@ function connect() {
     }
   };
   ws.onclose = () => { $('st').textContent = '切断（再接続します）'; setTimeout(connect, 1000); };
+}
+
+// New stream size (HDMI mode change, or a page cached from before one):
+// resize the canvas and configure the decoder again at the next key frame.
+function setSize(w, h) {
+  if (!w || !h || (w === W && h === H)) return;
+  W = w; H = h;
+  cv.width = W; cv.height = H;
+  $('size').textContent = W + 'x' + H;
+  probes.length = 0;
+  configured = false;
+  applyScale();
+  $('st').textContent = W + 'x' + H + ' に切り替え（キーフレーム待ち）';
 }
 
 function pos(e) {
@@ -1803,7 +1946,9 @@ def main():
     p.add_argument("--hid-baud", type=int, default=115200, help="UART baud rate")
     p.add_argument("--width", type=int, default=0,
                    help="video size (default: 1920x1080 for capture = dot-by-dot "
-                        "for a 1080p source, 1280x720 for the test screen)")
+                        "for a 1080p source, 1280x720 for the test screen; csi: the "
+                        "source's size, and with a TC358743 the stream follows HDMI "
+                        "mode changes; a fixed size is scaled to instead)")
     p.add_argument("--height", type=int, default=0)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--qp", type=int, default=28, help="constant QP, or initial QP with --bitrate")
@@ -1844,6 +1989,8 @@ def main():
             csi = Csi(args.csi_media, args.csi_edid)
             if args.width % 2 or args.height % 2:
                 p.error("width/height must be even")
+            # without --width/--height the stream follows the HDMI mode
+            csi.follow = csi.kind == "tc358743" and not args.width and not args.height
             args.width, args.height = csi.configure(args.width, args.height)
         except (OSError, RuntimeError, subprocess.SubprocessError) as e:
             p.error("csi: %s" % e)

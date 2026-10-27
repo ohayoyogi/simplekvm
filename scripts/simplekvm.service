@@ -1,0 +1,22 @@
+# kvm.py as a systemd service. Installed by scripts/install-service.sh, which
+# fills in @USER@ and @DIR@ (the checkout with kvm.py). Options go into
+# /etc/default/simplekvm (KVM_ARGS), e.g. KVM_ARGS="--source csi --fps 60".
+[Unit]
+Description=simplekvm (LAN KVM: kvm.py)
+Documentation=file:@DIR@/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+Environment=KVM_ARGS=
+EnvironmentFile=-/etc/default/simplekvm
+ExecStart=/usr/bin/python3 @DIR@/kvm.py $KVM_ARGS
+# e.g. the camera modules are not up yet at boot (no rkisp1 media device)
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

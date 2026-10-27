@@ -70,13 +70,26 @@ Useful options (`python3 kvm.py --help` for all):
 | Option | Meaning |
 |---|---|
 | `--source auto\|capture\|csi\|screen` | video source |
-| `--width/--height` | output size (CSI: scaled by the ISP) |
+| `--width/--height` | output size (CSI: scaled by the ISP). Without them a TC358743 stream follows the HDMI mode: a new mode restarts the stream at its size (a few seconds without picture) and the page resizes |
 | `--fps`, `--qp`, `--bitrate`, `--keyint` | encoder settings |
 | `--hid auto\|gadget\|none\|TTY` | RP2350 bridge or USB gadget (`auto`: the CDC firmware, else the gadget if set up) |
 | `--csi-edid FILE` | EDID for the TC358743 (e.g. one that offers 1080p50); not rewritten if already loaded, e.g. at boot by `tinker-camera.sh boot-edid on` |
 | `--fb-echo /dev/fb0` | loopback latency test: draw browser clicks on the board's screen |
 | `--idle-stop SEC` | stop capture/encoding when nobody watches (`-1` = never) |
 | `--gst-dir DIR` | where the patched GStreamer plugin is (`~/h264enc/gst`) |
+
+### Start at boot (systemd)
+
+```sh
+sudo scripts/install-service.sh install          # runs kvm.py as the sudo user, from this checkout
+sudoedit /etc/default/simplekvm                  # KVM_ARGS="--source csi --fps 60"
+sudo systemctl restart simplekvm
+journalctl -u simplekvm -f                       # log
+sudo scripts/install-service.sh uninstall
+```
+
+The unit (`scripts/simplekvm.service`) restarts kvm.py when it exits with an
+error, e.g. when the camera modules are not up yet at boot.
 
 ## Keyboard and mouse in the browser
 
@@ -121,6 +134,7 @@ device-tree overlay was needed.
 | `kvm.py` | the whole server: capture/encoder control, HTTPS + WebSocket, the page, HID |
 | `firmware/kvm-hid/` | RP2350-USB-A HID firmware, UART and USB CDC variants (README in Japanese) |
 | `scripts/ws-probe.py` | headless viewer for tests (fps, first-frame time, saves the H.264) |
+| `scripts/simplekvm.service`, `scripts/install-service.sh` | start kvm.py at boot with systemd (see above) |
 | `scripts/tinker-hid-gadget.sh` | the board itself as a USB HID gadget (see above) |
 | `scripts/tinker-otg-role-switch.dts` | overlay to force the OTG port's role by software (not needed so far, untested) |
 | `scripts/99-dev_tinker-usb-power.rules` | keeps UVC capture sticks from autosuspending |
@@ -133,7 +147,9 @@ device-tree overlay was needed.
 - With the C790 on RK3288 the ISP's MI_CTRL register resets itself a few
   times a minute; the patched rkisp1 driver restores it and drops one
   frame each time.
-- No `install.sh` / systemd unit yet; kvm.py is started by hand.
+- 1080p50 from the C790 is captured at 50 fps, but encoding it currently
+  falls far behind (under 12 fps in a test); 720p60 and 1080p30 run at
+  full rate.
 - No authentication: use it on a trusted LAN only.
 
 ## License
