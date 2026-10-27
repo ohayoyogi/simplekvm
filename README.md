@@ -127,6 +127,40 @@ device-tree overlay was needed.
 - The keyboard disappears from the target while the board reboots; the
   RP2350 stays powered by the target and does not.
 
+## Testing with a target PC
+
+`scripts/target/kvm-target.py` runs on the PC the KVM controls (Linux with
+a desktop, Python 3, Chromium/Chrome or Firefox). It shows a full-screen
+test page and a small HTTP API on port 8800: a frame counter drawn as black
+and white blocks on every display refresh, a white square at each click,
+a log of the key and mouse events that arrive, test tones, and display
+modes through `xrandr` (X11 sessions).
+
+`scripts/kvm-test.py` runs on the KVM board next to kvm.py, talks to kvm.py
+like a browser and checks the results against the target:
+
+```sh
+# on the target, from the desktop session
+python3 kvm-target.py
+# on the board
+python3 scripts/kvm-test.py --target http://TARGET:8800 all      # status, input, video, latency, mode
+python3 scripts/kvm-test.py --target http://TARGET:8800 input --layout jis
+python3 scripts/kvm-test.py --target http://TARGET:8800 audio --alsa-device hw:CARD=X
+```
+
+| Test | Checks |
+|---|---|
+| `status` | test page open, HID connected, video arriving |
+| `input` | click positions (absolute mouse), key codes, Shift/Ctrl, typed text in the target's layout, wheel, relative mouse |
+| `video` | every frame decodes, and the frame counter neither repeats (stale frames) nor jumps (dropped frames) |
+| `latency` | click sent to kvm.py until the frame showing it arrives (the browser's decode not included) |
+| `mode` | for each display mode: the stream follows it, and video keeps flowing |
+| `audio` | a tone played on the target, recorded on the board (`arecord`): frequency, level, left/right |
+
+The video is decoded on the board with GStreamer (`--decoder`, default the
+hardware `v4l2slh264dec`). The test API has no authentication; run it on a
+test network.
+
 ## Repository layout
 
 | Path | Contents |
@@ -135,6 +169,7 @@ device-tree overlay was needed.
 | `firmware/kvm-hid/` | RP2350-USB-A HID firmware, UART and USB CDC variants (README in Japanese) |
 | `scripts/ws-probe.py` | headless viewer for tests (fps, first-frame time, saves the H.264) |
 | `scripts/simplekvm.service`, `scripts/install-service.sh` | start kvm.py at boot with systemd (see above) |
+| `scripts/kvm-test.py`, `scripts/target/kvm-target.py` | end-to-end tests against a target PC (see "Testing with a target PC") |
 | `scripts/tinker-hid-gadget.sh` | the board itself as a USB HID gadget (see above) |
 | `scripts/tinker-otg-role-switch.dts` | overlay to force the OTG port's role by software (not needed so far, untested) |
 | `scripts/99-dev_tinker-usb-power.rules` | keeps UVC capture sticks from autosuspending |
