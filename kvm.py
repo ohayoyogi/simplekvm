@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Minimal LAN KVM prototype (Python standard library only).
 
-Video comes from a UVC capture stick (MJPEG, decoded on the CPU) or from a
-built-in test screen (an NV12 frame buffer rendered here). Either way it is
-encoded to H.264 by the RK3288 VPU through GStreamer (v4l2slh264enc),
-streamed to the browser over WebSocket and decoded there with WebCodecs.
-There is no HID sink yet: mouse input from the browser is applied to the
-test screen, or (capture + --fb-echo) drawn on this board's own HDMI
-output, so the input -> frame -> encode -> display loop can be exercised
-and its latency measured.
+Video comes from a UVC capture stick (MJPEG, decoded on the CPU), a CSI-2
+source on the RK3288 ISP, or a built-in test screen (an NV12 frame buffer
+rendered here). It is encoded to H.264 through GStreamer, streamed to the
+browser over WebSocket and decoded there with WebCodecs. Keyboard and mouse
+go out through an RP2350 HID bridge (USB CDC or UART) or this board as a
+USB HID gadget.
+
+Encoders (--encoder, default auto = the first one GStreamer has):
+v4l2slh264enc (RK3288 VPU, patched GStreamer from rk3288-mainline-media),
+vah264enc / vaapih264enc (Intel/AMD VA-API), nvh264enc (NVIDIA), x264enc
+(software). So a UVC stick and the RP2350 also work on an ordinary x86 Linux.
 
     python3 kvm.py [--source auto|capture|csi|screen] [--device /dev/v4l/by-id/...]
+                   [--encoder auto|v4l2sl|va|vaapi|nv|x264]
                    [--fb-echo /dev/fb0] [--port 8443]
                    [--width 1280 --height 720 --fps 30 --capture-fps 60]
                    [--qp 28 | --bitrate 4000000] [--keyint 30]
@@ -27,8 +31,6 @@ Open https://<board>:8443/ in Chrome/Edge (accept the self-signed
 certificate once). WebCodecs only runs in a secure context, so plain
 --http works only through localhost, e.g. "ssh -L 8080:localhost:8080".
 
-Later stages swap the two ends: the screen buffer for a UVC / C790 capture
-source, and ScreenInput for a HID sink (RP2350 over UART or a USB gadget).
 """
 
 import argparse
@@ -874,8 +876,76 @@ class Csi:
 
 
 # --------------------------------------------------------------------------
-# Encoder: GStreamer v4l2slh264enc, frames in on stdin, RTP out on UDP
+# Encoder: GStreamer H.264 encoder, RTP out on UDP
 # --------------------------------------------------------------------------
+
+# --encoder name -> GStreamer element, in the order "auto" tries them
+ENCODERS = (("v4l2sl", "v4l2slh264enc"), ("va", "vah264enc"), ("vaapi", "vaapih264enc"),
+            ("nv", "nvh264enc"), ("x264", "x264enc"))
+
+
+def gst_env(gst_dir):
+    """Environment for gst-launch / gst-inspect: a GStreamer build in
+    gst_dir (the patched v4l2codecs plugin) comes first if it exists."""
+    env = dict(os.environ)
+    gst = os.path.expanduser(gst_dir)
+    if os.path.isdir(gst):
+        env["GST_PLUGIN_PATH"] = os.path.join(gst, "lib", "gstreamer-1.0")
+        env["LD_LIBRARY_PATH"] = os.path.join(gst, "lib")
+    return env
+
+
+def pick_encoder(choice, gst_dir):
+    """--encoder: check the element exists; auto = the first one that does.
+    Returns the name, or raises RuntimeError."""
+    env = gst_env(gst_dir)
+
+    def exists(element):
+        try:
+            return subprocess.run(["gst-inspect-1.0", "--exists", element], env=env,
+                                  capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    names = [n for n, _ in ENCODERS] if choice == "auto" else [choice]
+    for name in names:
+        if exists(dict(ENCODERS)[name]):
+            return name
+    raise RuntimeError("no H.264 encoder: %s not found by gst-inspect-1.0" %
+                       ", ".join(dict(ENCODERS)[n] for n in names))
+
+
+def encoder_args(name, a):
+    """Element and properties for each encoder: no B-frames (every frame
+    goes out at once), an IDR every --keyint frames, constant QP (--qp) or
+    CBR (--bitrate)."""
+    k, qp, kbps = a.keyint, a.qp, max(1, a.bitrate // 1000)
+    if name == "v4l2sl":
+        e = ["v4l2slh264enc", "keyframe-interval=%d" % k]
+        e += (["rate-control=cbr", "bitrate=%d" % a.bitrate, "quantizer=%d" % qp]
+              if a.bitrate else ["quantizer=%d" % qp])
+    elif name == "x264":
+        # zerolatency: no B-frames and no lookahead; sliced threads keep one
+        # frame in flight
+        e = ["x264enc", "tune=zerolatency", "speed-preset=ultrafast", "sliced-threads=true",
+             "key-int-max=%d" % k, "bframes=0"]
+        e += (["pass=cbr", "bitrate=%d" % kbps] if a.bitrate else ["pass=quant", "quantizer=%d" % qp])
+    elif name == "va":
+        e = ["vah264enc", "key-int-max=%d" % k, "b-frames=0"]
+        e += (["rate-control=cbr", "bitrate=%d" % kbps] if a.bitrate
+              else ["rate-control=cqp", "qpi=%d" % qp, "qpp=%d" % qp])
+    elif name == "vaapi":
+        e = ["vaapih264enc", "keyframe-period=%d" % k, "max-bframes=0"]
+        e += (["rate-control=cbr", "bitrate=%d" % kbps] if a.bitrate
+              else ["rate-control=cqp", "init-qp=%d" % qp])
+    else:                                   # nv
+        e = ["nvh264enc", "gop-size=%d" % k, "bframes=0", "zerolatency=true"]
+        e += (["rc-mode=cbr", "bitrate=%d" % kbps] if a.bitrate
+              else ["rc-mode=constqp", "qp-const=%d" % qp])
+    if name in ("va", "vaapi", "nv"):
+        # GPU encoders take NV12; the capture path hands I420
+        e = ["videoconvert", "!", "video/x-raw,format=NV12", "!"] + e
+    return e
+
 
 class Encoder:
     def __init__(self, args, on_au, csi=None):
@@ -902,12 +972,8 @@ class Encoder:
 
     def gst_cmd(self):
         a = self.args
-        enc = ["v4l2slh264enc", "keyframe-interval=%d" % a.keyint]
-        if a.bitrate:
-            enc += ["rate-control=cbr", "bitrate=%d" % a.bitrate, "quantizer=%d" % a.qp]
-        else:
-            enc += ["quantizer=%d" % a.qp]
-        leaky = ["queue", "max-size-buffers=1", "max-size-bytes=0",
+        enc = encoder_args(a.encoder, a)
+        leaky =["queue", "max-size-buffers=1", "max-size-bytes=0",
                  "max-size-time=0", "leaky=downstream", "!"]
         if a.source == "csi":
             # rkisp1 main path: NV12 straight from the ISP.
@@ -957,11 +1023,7 @@ class Encoder:
                 "sync=false", "async=false"]
 
     def start(self, prepare=True):
-        env = dict(os.environ)
-        gst = os.path.expanduser(self.args.gst_dir)
-        if os.path.isdir(gst):
-            env["GST_PLUGIN_PATH"] = os.path.join(gst, "lib", "gstreamer-1.0")
-            env["LD_LIBRARY_PATH"] = os.path.join(gst, "lib")
+        env = gst_env(self.args.gst_dir)
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
@@ -1960,7 +2022,15 @@ def main():
                         "(-1 = keep running)")
     p.add_argument("--gst-dir",default="~/h264enc/gst",
                    help="GStreamer build with v4l2slh264enc (lib/gstreamer-1.0)")
+    p.add_argument("--encoder", default="auto", choices=["auto"] + [n for n, _ in ENCODERS],
+                   help="H.264 encoder: v4l2sl = v4l2slh264enc (RK3288 VPU), va = vah264enc, "
+                        "vaapi = vaapih264enc (Intel/AMD), nv = nvh264enc (NVIDIA), "
+                        "x264 = x264enc (software); auto = the first of these GStreamer has")
     args = p.parse_args()
+    try:
+        args.encoder = pick_encoder(args.encoder, args.gst_dir)
+    except RuntimeError as e:
+        p.error(str(e))
     if args.device == "auto":
         byid = "/dev/v4l/by-id"
         cands = sorted(os.listdir(byid)) if os.path.isdir(byid) else []
@@ -2011,7 +2081,8 @@ def main():
         p.error("width/height must be even")     # 4:2:0; the encoder crops to 16-px MBs
     log("source:", args.source,
         args.device if args.source == "capture" else csi.sensor if csi else "",
-        "%dx%d" % (args.width, args.height), "hid:", args.hid or "none")
+        "%dx%d" % (args.width, args.height), "encoder:", dict(ENCODERS)[args.encoder],
+        "hid:", args.hid or "none")
 
     kvm = KVM(args, csi)
     srv = Server(("0.0.0.0", args.port), make_handler(kvm))

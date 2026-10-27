@@ -10,7 +10,9 @@ browser ──HTTPS / WebSocket── SBC running kvm.py ──┬─ HDMI captu
 ```
 
 - **One Python file, standard library only** (`kvm.py`). Video encoding is
-  done by GStreamer with the SoC's hardware H.264 encoder.
+  done by GStreamer: the SoC's hardware H.264 encoder on the RK3288, VA-API
+  or NVENC on a PC, or x264 in software. With a UVC capture stick and the
+  RP2350 it also runs on an ordinary x86 Linux machine.
 - **H.264 over WebSocket, decoded in the browser with WebCodecs**: no
   WebRTC server, no MJPEG bandwidth.
 - **Keyboard and mouse through a small RP2350 board** acting as a USB HID
@@ -40,9 +42,18 @@ overlays and EDIDs.
 
 ## Requirements
 
-- An SBC with a V4L2 stateless H.264 encoder exposed to GStreamer as
-  `v4l2slh264enc` (on RK3288: the patches above), GStreamer 1.24 runtime
-  (`gstreamer1.0-plugins-base`, `-good`, `-bad`), `openssl`, Python 3.
+- A Linux machine with Python 3, `openssl` and GStreamer 1.24
+  (`gstreamer1.0-tools`, `-plugins-base`, `-good`, `-bad`), and an H.264
+  encoder element (`--encoder`, default: the first one found):
+  - `v4l2slh264enc`: a V4L2 stateless encoder, e.g. the RK3288 VPU with the
+    patches above;
+  - `vah264enc` / `vaapih264enc`: Intel or AMD graphics (VA-API);
+  - `nvh264enc`: NVIDIA (NVENC);
+  - `x264enc` (`gstreamer1.0-plugins-ugly`): software, any x86 PC.
+
+  On x86 so far only x264 has been tried (Ubuntu 24.04 container, test
+  screen and the capture path's formats); the VA-API and NVENC settings are
+  untested.
 - A video source: a UVC HDMI capture stick, or on RK3288 a TC358743
   bridge / OV5647 camera on the CSI connector (`media-ctl` and `v4l2-ctl`
   from `v4l-utils`).
@@ -71,6 +82,7 @@ Useful options (`python3 kvm.py --help` for all):
 |---|---|
 | `--source auto\|capture\|csi\|screen` | video source |
 | `--width/--height` | output size (CSI: scaled by the ISP). Without them a TC358743 stream follows the HDMI mode: a new mode restarts the stream at its size (a few seconds without picture) and the page resizes |
+| `--encoder auto\|v4l2sl\|va\|vaapi\|nv\|x264` | H.264 encoder (`auto`: the first GStreamer has, in this order) |
 | `--fps`, `--qp`, `--bitrate`, `--keyint` | encoder settings |
 | `--hid auto\|gadget\|none\|TTY` | RP2350 bridge or USB gadget (`auto`: the CDC firmware, else the gadget if set up) |
 | `--csi-edid FILE` | EDID for the TC358743 (e.g. one that offers 1080p50); not rewritten if already loaded, e.g. at boot by `tinker-camera.sh boot-edid on` |
