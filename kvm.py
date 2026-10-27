@@ -876,18 +876,21 @@ class Encoder:
         leaky = ["queue", "max-size-buffers=1", "max-size-bytes=0",
                  "max-size-time=0", "leaky=downstream", "!"]
         if a.source == "csi":
-            # rkisp1 main path: NV12 straight from the ISP. drop-allocation
-            # keeps v4l2src on its own buffers (importing the encoder's
-            # macroblock-padded pool is rejected with EINVAL); the encoder
-            # then copies the visible area (rk3288-mainline-media:
-            # patches/gstreamer/0002).
+            # rkisp1 main path: NV12 straight from the ISP.
             # io-mode=mmap: with the default (auto) v4l2src hands out stale
-            # buffers, the same 4 frames over and over while the ISP runs.
+            # buffers, the same 4 frames over and over while the ISP runs,
+            # or imports the encoder's macroblock-padded pool (EINVAL).
+            # With mmap it pushes its own buffers and the encoder copies the
+            # visible area (rk3288-mainline-media: patches/gstreamer/0002).
+            # Let the allocation query through: from the encoder's minimum
+            # v4l2src sizes its pool (4 buffers). Dropping it left v4l2src
+            # with 2 plus a copy into a generic pool, and since Linux 6.14
+            # rkisp1 no longer rounds 2 up to 4: at 720p60 every third frame
+            # went to the ISP's dummy buffer (40 fps).
             src = ["v4l2src", "device=%s" % self.csi.video, "io-mode=mmap",
                    "do-timestamp=true", "!",
                    "video/x-raw,format=NV12,width=%d,height=%d,framerate=%d/1"
-                   % (a.width, a.height, a.fps), "!"] + leaky + [
-                   "identity", "drop-allocation=true", "!"]
+                   % (a.width, a.height, a.fps), "!"] + leaky
         elif a.source == "capture":
             # UVC MJPEG -> CPU jpegdec -> VPU. This capture stick sends a few
             # full-size (1080p) JPEGs before switching to the requested size,
