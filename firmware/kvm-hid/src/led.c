@@ -26,10 +26,15 @@ void led_init(PIO pio, unsigned pin) {
 }
 
 static void put_rgb(uint8_t r, uint8_t g, uint8_t b) {
-  uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
-  if (led_sm < 0 || grb == last_rgb) return;
-  last_rgb = grb;
-  pio_sm_put_blocking(led_pio, (uint)led_sm, grb << 8u);
+#if KVM_LED_RGB
+  // the RP2350-USB-A's LED takes red first, not the usual WS2812 green
+  uint32_t word = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+#else
+  uint32_t word = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+#endif
+  if (led_sm < 0 || word == last_rgb) return;
+  last_rgb = word;
+  pio_sm_put_blocking(led_pio, (uint)led_sm, word << 8u);
 }
 
 void led_task(bool link_up, bool target_ok, bool suspended, uint32_t last_activity_ms) {

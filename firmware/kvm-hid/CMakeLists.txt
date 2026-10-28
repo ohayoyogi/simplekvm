@@ -16,6 +16,10 @@ pico_sdk_init()
 
 set(KVM_HID_VERSION "0.1" CACHE STRING "")
 set(KVM_UART_BAUD 115200 CACHE STRING "UART variant baud rate")
+# Colour order of the board's WS2812-type LED: 1 = RGB (seen on the
+# RP2350-USB-A), 0 = the usual GRB
+set(KVM_LED_RGB 1 CACHE STRING "LED takes R, G, B (1) or G, R, B (0)")
+add_compile_definitions(KVM_LED_RGB=${KVM_LED_RGB})
 
 set(COMMON_SRC
     ${CMAKE_CURRENT_LIST_DIR}/src/proto.c
