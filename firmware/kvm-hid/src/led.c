@@ -8,10 +8,11 @@ static PIO led_pio;
 static int led_sm = -1;
 static uint32_t last_rgb = 0xffffffff;
 
-void led_init(PIO pio, unsigned pin) {
-  led_pio = pio;
+bool led_init(PIO pio, unsigned pin) {
+  if (!pio_can_add_program(pio, &ws2812_program)) return false;
   led_sm = pio_claim_unused_sm(pio, false);
-  if (led_sm < 0) return;
+  if (led_sm < 0) return false;
+  led_pio = pio;
   uint offset = pio_add_program(pio, &ws2812_program);
   pio_gpio_init(pio, pin);
   pio_sm_set_consecutive_pindirs(pio, (uint)led_sm, pin, 1, true);
@@ -23,11 +24,12 @@ void led_init(PIO pio, unsigned pin) {
   sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (800000.0f * (float)cycles_per_bit));
   pio_sm_init(pio, (uint)led_sm, offset, &c);
   pio_sm_set_enabled(pio, (uint)led_sm, true);
+  return true;
 }
 
 static void put_rgb(uint8_t r, uint8_t g, uint8_t b) {
 #if KVM_LED_RGB
-  // the RP2350-USB-A's LED takes red first, not the usual WS2812 green
+  // the LED on these boards takes red first, not the usual WS2812 green
   uint32_t word = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 #else
   uint32_t word = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;

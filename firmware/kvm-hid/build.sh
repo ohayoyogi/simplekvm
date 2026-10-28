@@ -1,11 +1,16 @@
 #!/bin/bash
-# Build kvm_hid_uart.uf2 / kvm_hid_cdc.uf2 in Docker (run inside WSL).
+# Build the firmware in Docker (run inside WSL), for each board:
+#   out/kvm_hid_uart.uf2, out/kvm_hid_cdc.uf2                       Waveshare RP2350-USB-A
+#   out/kvm_hid_uart_rp2040_zero.uf2, out/kvm_hid_cdc_rp2040_zero.uf2  Waveshare RP2040-Zero
 # The build tree lives on the WSL ext4 side (~/kvm-hid-build), not on /mnt.
 #
 #   bash firmware/kvm-hid/build.sh            # -> firmware/kvm-hid/out/*.uf2
+#   KVM_BOARDS=rp2040_zero bash firmware/kvm-hid/build.sh
+#   KVM_BOARDS=rp2040_zero KVM_PIO_USB_DP_PIN=26 bash ...   # PIO-USB on GP26/GP27
 #   KVM_UART_BAUD=921600 bash firmware/kvm-hid/build.sh
 #
-# Flash: hold BOOT, plug USB-C into a PC, copy the .uf2 to the RP2350 drive.
+# Flash: hold BOOT, plug USB-C into a PC, copy the .uf2 to the RP2350 / RP2
+# drive.
 set -euo pipefail
 
 SRC=$(cd "$(dirname "$0")" && pwd)
@@ -15,6 +20,7 @@ PIOUSB_TAG=${PIOUSB_TAG:-0.7.3}
 IMG=kvm-hid-pico
 BAUD=${KVM_UART_BAUD:-115200}
 SYS_KHZ=${KVM_SYS_KHZ:-120000}
+BOARDS=${KVM_BOARDS:-rp2350_usb_a rp2040_zero}
 
 mkdir -p "$WORK"
 if ! docker image inspect $IMG >/dev/null 2>&1; then
@@ -43,12 +49,19 @@ for p in "$SRC"/patches/pico-pio-usb-"$PIOUSB_TAG"-*.patch; do
 done
 rm -rf src && cp -r "$SRC" src && rm -rf src/out
 
-docker run --rm -u "$(id -u):$(id -g)" -v "$WORK:/w" -w /w -e HOME=/w \
-	-e PICO_SDK_PATH=/w/pico-sdk -e PICO_PIO_USB_PATH=/w/Pico-PIO-USB $IMG bash -c "
-set -e
-cmake -S src -B build -G Ninja -DKVM_UART_BAUD=$BAUD -DKVM_SYS_KHZ=$SYS_KHZ >/dev/null
-ninja -C build kvm_hid_uart kvm_hid_cdc
-"
 mkdir -p "$SRC/out"
-cp "$WORK"/build/kvm_hid_uart.uf2 "$WORK"/build/kvm_hid_cdc.uf2 "$SRC/out/"
+for b in $BOARDS; do
+	# one build tree per board (PICO_BOARD / PICO_PLATFORM are fixed per tree)
+	B=build-$b
+	docker run --rm -u "$(id -u):$(id -g)" -v "$WORK:/w" -w /w -e HOME=/w \
+		-e PICO_SDK_PATH=/w/pico-sdk -e PICO_PIO_USB_PATH=/w/Pico-PIO-USB $IMG bash -c "
+set -e
+cmake -S src -B $B -G Ninja -DKVM_BOARD=$b -DKVM_UART_BAUD=$BAUD -DKVM_SYS_KHZ=$SYS_KHZ \
+	${KVM_PIO_USB_DP_PIN:+-DKVM_PIO_USB_DP_PIN=$KVM_PIO_USB_DP_PIN} >/dev/null
+ninja -C $B kvm_hid_uart kvm_hid_cdc
+"
+	suffix=$([ "$b" = rp2350_usb_a ] || echo "_$b")
+	cp "$WORK/$B/kvm_hid_uart.uf2" "$SRC/out/kvm_hid_uart$suffix.uf2"
+	cp "$WORK/$B/kvm_hid_cdc.uf2" "$SRC/out/kvm_hid_cdc$suffix.uf2"
+done
 ls -la "$SRC/out"

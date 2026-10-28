@@ -1,6 +1,8 @@
 // CDC variant: the KVM host talks to the native USB-C port (CDC ACM, so no
 // UART wiring), and the USB-A port (PIO-USB, GP12 = D+, GP13 = D-) acts as a
-// full-speed HID device for the target PC.
+// full-speed HID device for the target PC. On the RP2040-Zero (KVM_BOARD =
+// rp2040_zero) D+ / D- are GP14 / GP15, wired to a USB cable (with a 1.5 kΩ
+// pull-up from D+ to 3.3 V, see README).
 //
 // WARNING: the board's USB-A receptacle is a host port that supplies 5 V. To
 // connect it to a PC you need an A-to-A cable with VBUS (pin 1) cut, or the
@@ -14,6 +16,7 @@
 #include "bridge.h"
 #include "class/hid/hid.h"   // HID constants (TinyUSB's HID class is not built here)
 #include "hardware/clocks.h"
+#include "hardware/vreg.h"
 #include "led.h"
 #include "pico/bootrom.h"
 #include "pico/multicore.h"
@@ -91,9 +94,11 @@ static void init_strings(void) {
 static void core1_main(void) {
   sleep_ms(10);
   static pio_usb_configuration_t config = PIO_USB_DEFAULT_CONFIG;
-  config.pin_dp = PICO_DEFAULT_PIO_USB_DP_PIN;   // GP12, D- = GP13
+  config.pin_dp = KVM_PIO_USB_DP_PIN;            // D- is the next GPIO
   // TX stays on pio0; the device receiver from our Pico-PIO-USB patch
-  // (usb_dev_rx) fills all 32 instructions of a PIO block, so it gets pio1.
+  // (usb_dev_rx, RP2350) fills all 32 instructions of a PIO block, so it gets
+  // pio1. On RP2040 the original receiver (edge detector + NRZI decoder) runs
+  // there instead.
   config.pio_rx_num = 1;
   config.sm_rx = 0;
   config.sm_eop = 1;                             // claimed, unused in device mode
@@ -204,6 +209,12 @@ int main(void) {
   // PIO-USB needs 120 or 240 MHz (TX at clk_sys / 48 MHz, our receiver at
   // clk_sys / 96 MHz). 120 MHz is within the RP2350's rating; the stock
   // receiver needed 240 MHz to re-arm in time, usb_dev_rx does not.
+#if PICO_RP2040 && KVM_SYS_KHZ > 133000
+  // RP2040 above its 133 MHz rating (240 MHz for the original receiver):
+  // raise the core voltage first, as is usual for this overclock
+  vreg_set_voltage(VREG_VOLTAGE_1_15);
+  sleep_ms(2);
+#endif
   set_sys_clock_khz(KVM_SYS_KHZ, true);
   stdio_uart_init();          // UART0 (GP0/GP1) carries debug printf only
 
@@ -214,7 +225,14 @@ int main(void) {
   multicore_reset_core1();
   multicore_launch_core1(core1_main);
 
+#if NUM_PIOS > 2
   led_init(pio2, PICO_DEFAULT_WS2812_PIN);   // pio0/pio1 belong to PIO-USB
+#else
+  // RP2040 has two PIO blocks, both used by PIO-USB: the LED takes what is
+  // left of pio0 (TX) once core 1 has set PIO-USB up, else stays dark
+  while (pio_dev == NULL) tight_loop_contents();
+  if (!led_init(pio0, PICO_DEFAULT_WS2812_PIN)) printf("no room for the LED in pio0\n");
+#endif
   tusb_init();
   printf("kvm-hid cdc started\n");
 

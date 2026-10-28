@@ -8,5 +8,7 @@
 
 #include "hardware/pio.h"
 
-void led_init(PIO pio, unsigned pin);
+// false (and no LED) if the PIO block has no free state machine or no room
+// for the program
+bool led_init(PIO pio, unsigned pin);
 void led_task(bool link_up, bool target_ok, bool suspended, uint32_t last_activity_ms);
