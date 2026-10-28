@@ -81,6 +81,7 @@ Useful options (`python3 kvm.py --help` for all):
 | Option | Meaning |
 |---|---|
 | `--source auto\|capture\|csi\|screen` | video source |
+| `--bind ADDR`, `--port N`, `--http` | where to listen (default `0.0.0.0:8443`, HTTPS); see "Authentication" |
 | `--width/--height` | output size (CSI: scaled by the ISP). Without them a TC358743 stream follows the HDMI mode: a new mode restarts the stream at its size (a few seconds without picture) and the page resizes |
 | `--encoder auto\|v4l2sl\|va\|vaapi\|nv\|x264` | H.264 encoder (`auto`: the first GStreamer has, in this order) |
 | `--fps`, `--qp`, `--bitrate`, `--keyint` | encoder settings |
@@ -102,6 +103,104 @@ sudo scripts/install-service.sh uninstall
 
 The unit (`scripts/simplekvm.service`) restarts kvm.py when it exits with an
 error, e.g. when the camera modules are not up yet at boot.
+
+## Authentication (put it in front of kvm.py)
+
+kvm.py has no login of its own: whoever reaches the port controls the
+target PC. Keep it on a trusted network, and add authentication outside
+kvm.py with one of the setups below. Never expose the port to the internet
+directly.
+
+In each setup kvm.py listens on localhost only (`--bind 127.0.0.1`), so the
+port cannot be reached around the front end. The browser still needs a
+secure context for WebCodecs: HTTPS from the proxy, or `http://localhost`
+through a tunnel, so kvm.py itself can run with `--http`.
+
+### Caddy (Basic auth, HTTPS)
+
+```sh
+python3 kvm.py --bind 127.0.0.1 --port 8080 --http --source csi --fps 60
+caddy hash-password                  # prints the hash for the password you type
+```
+
+`/etc/caddy/Caddyfile`:
+
+```
+https://kvm.lan {
+    tls internal                     # Caddy's own CA; or a real certificate
+    basic_auth {
+        admin <hash from caddy hash-password>
+    }
+    reverse_proxy 127.0.0.1:8080     # WebSocket (/ws) is proxied as is
+}
+```
+
+`tls internal` needs the browser to trust Caddy's root certificate
+(`caddy trust`, or import it on each client); otherwise accept the
+warning once, as with kvm.py's own certificate.
+
+### nginx (Basic auth, HTTPS)
+
+```sh
+python3 kvm.py --bind 127.0.0.1 --port 8080 --http --source csi --fps 60
+sudo htpasswd -c /etc/nginx/kvm.htpasswd admin   # apache2-utils
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name kvm.lan;
+    ssl_certificate     /etc/nginx/kvm-cert.pem;
+    ssl_certificate_key /etc/nginx/kvm-key.pem;
+
+    auth_basic           "simplekvm";
+    auth_basic_user_file /etc/nginx/kvm.htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;     # WebSocket (/ws)
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;                      # keep an idle session open
+        proxy_buffering off;
+    }
+}
+```
+
+The certificate kvm.py made (`~/.config/dev_tinker/kvm-*.pem`) can be
+reused here. For only a few known clients, client certificates
+(`ssl_verify_client on;`, or `tls { client_auth ... }` in Caddy) are a
+stronger alternative to a password.
+
+### SSH tunnel (one user, nothing to install)
+
+```sh
+python3 kvm.py --bind 127.0.0.1 --port 8080 --http --source csi --fps 60   # on the board
+ssh -N -L 8080:127.0.0.1:8080 user@board                                  # on the client
+```
+
+Then open `http://localhost:8080/`. SSH keys are the authentication.
+
+### Tailscale / WireGuard (from outside the LAN)
+
+Join the board to a VPN and reach kvm.py only through it, without opening
+a port on the router. With Tailscale either bind to the board's tailnet
+address (`--bind 100.x.y.z`), or keep `--bind 127.0.0.1 --http` and let
+Tailscale serve it with a certificate and its access controls:
+
+```sh
+sudo tailscale serve --bg --https=443 http://127.0.0.1:8080
+```
+
+Open `https://<board>.<tailnet>.ts.net/`. Only devices allowed by the
+tailnet's ACLs can connect.
+
+### With the systemd unit
+
+Put the options in `/etc/default/simplekvm`, e.g.
+`KVM_ARGS="--bind 127.0.0.1 --port 8080 --http --source csi --fps 60"`.
+When binding to a VPN address, kvm.py may start before that address
+exists; the unit then restarts it until it does.
 
 ## Keyboard and mouse in the browser
 
@@ -197,7 +296,8 @@ test network.
 - 1080p50 from the C790 is captured at 50 fps, but encoding it currently
   falls far behind (under 12 fps in a test); 720p60 and 1080p30 run at
   full rate.
-- No authentication: use it on a trusted LAN only.
+- No authentication of its own: use it on a trusted LAN only, or behind
+  one of the front ends in "Authentication".
 
 ## License
 

@@ -1980,9 +1980,13 @@ def ensure_cert(cert, key):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--bind", default="0.0.0.0", metavar="ADDR",
+                   help="address to listen on; 127.0.0.1 behind a reverse proxy or an "
+                        "ssh tunnel, so the port cannot be reached around it")
     p.add_argument("--port", type=int, default=8443)
     p.add_argument("--http", action="store_true",
-                   help="plain http (only usable via localhost, e.g. an ssh tunnel)")
+                   help="plain http (only usable via localhost, e.g. an ssh tunnel or "
+                        "a reverse proxy that serves https)")
     p.add_argument("--cert", default="~/.config/dev_tinker/kvm-cert.pem")
     p.add_argument("--key", default="~/.config/dev_tinker/kvm-key.pem")
     p.add_argument("--source", choices=["auto", "capture", "csi", "screen"], default="auto",
@@ -2085,7 +2089,9 @@ def main():
         "hid:", args.hid or "none")
 
     kvm = KVM(args, csi)
-    srv = Server(("0.0.0.0", args.port), make_handler(kvm))
+    if ":" in args.bind:
+        Server.address_family = socket.AF_INET6
+    srv = Server((args.bind, args.port), make_handler(kvm))
     scheme = "http"
     if not args.http:
         cert, key = os.path.expanduser(args.cert), os.path.expanduser(args.key)
@@ -2095,7 +2101,11 @@ def main():
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         scheme = "https"
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    for a in [socket.gethostname()] + local_addresses():
+    if args.bind in ("0.0.0.0", "::"):
+        addrs = [socket.gethostname()] + local_addresses()
+    else:
+        addrs = ["[%s]" % args.bind if ":" in args.bind else args.bind]
+    for a in addrs:
         log("%s://%s:%d/" % (scheme, a, args.port))
     def on_term(signum, frame):
         raise KeyboardInterrupt      # kill / systemd stop: take GStreamer down too
