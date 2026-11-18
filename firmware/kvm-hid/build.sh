@@ -34,13 +34,16 @@ if [ -d Pico-PIO-USB ] && [ "$(git -C Pico-PIO-USB describe --tags 2>/dev/null)"
 	rm -rf Pico-PIO-USB   # another version: fetch again
 fi
 [ -d Pico-PIO-USB ] || git clone -q --depth 1 --branch "$PIOUSB_TAG" https://github.com/sekigon-gonnoc/Pico-PIO-USB
-# Our fixes to Pico-PIO-USB (patches/pico-pio-usb-<tag>-*.patch), applied once.
+# Our changes to Pico-PIO-USB (patches/pico-pio-usb-<tag>-*.patch, in name
+# order), applied to a clean tree on every build: a patch that follows
+# another one cannot be detected as applied on its own.
 # PIOUSB_PATCHED=1 skips this, e.g. while the tree carries extra debug edits.
-for p in "$SRC"/patches/pico-pio-usb-"$PIOUSB_TAG"-*.patch; do
-	[ "${PIOUSB_PATCHED:-0}" = 1 ] && break
-	[ -e "$p" ] || continue
-	git -C Pico-PIO-USB apply --reverse --check "$p" 2>/dev/null || git -C Pico-PIO-USB apply "$p"
-done
+if [ "${PIOUSB_PATCHED:-0}" != 1 ]; then
+	git -C Pico-PIO-USB checkout -q -- .
+	for p in "$SRC"/patches/pico-pio-usb-"$PIOUSB_TAG"-*.patch; do
+		[ -e "$p" ] && git -C Pico-PIO-USB apply "$p"
+	done
+fi
 rm -rf src && cp -r "$SRC" src && rm -rf src/out
 
 docker run --rm -u "$(id -u):$(id -g)" -v "$WORK:/w" -w /w -e HOME=/w \
