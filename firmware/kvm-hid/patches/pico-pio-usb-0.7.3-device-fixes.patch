@@ -14,7 +14,7 @@ index 30a87d3..353a867 100644
  int pio_usb_set_out_data(endpoint_t *ep, const uint8_t *buffer, uint8_t len);
  
 diff --git a/src/pio_usb_device.c b/src/pio_usb_device.c
-index 5057152..6c0cecf 100644
+index 5057152..4fa20c6 100644
 --- a/src/pio_usb_device.c
 +++ b/src/pio_usb_device.c
 @@ -22,8 +22,16 @@
@@ -531,7 +531,18 @@ index 5057152..6c0cecf 100644
  void pio_usb_device_task(void) {
    root_port_t *rport = PIO_USB_ROOT_PORT(0);
    pio_port_t *pp = PIO_USB_PIO_PORT(0);
-@@ -401,14 +439,14 @@ void pio_usb_device_task(void) {
+@@ -393,7 +431,9 @@ void pio_usb_device_task(void) {
+     case DESC_TYPE_STRING: {
+       const uint16_t *str =
+           (uint16_t *)&descriptor_buffers.string[ep0_desc_request_idx];
+-      prepare_ep0_data((uint8_t *)str, str[0] & 0xff);
++      uint16_t const str_len = str[0] & 0xff;
++      prepare_ep0_data((uint8_t *)str,
++                       ep0_desc_request_len < str_len ? ep0_desc_request_len : str_len);
+       ep0_desc_request_type = -1;
+     } break;
+     case DESC_TYPE_HID_REPORT:{
+@@ -401,14 +441,14 @@ void pio_usb_device_task(void) {
            (uint8_t *)descriptor_buffers.hid_report[ep0_desc_request_idx],
            ep0_desc_request_len);
        ep0_desc_request_type = -1;
@@ -548,7 +559,7 @@ index 5057152..6c0cecf 100644
      busy_wait_us_32(1);
      se0_time_us++;
  
-@@ -428,14 +466,21 @@ void pio_usb_device_task(void) {
+@@ -428,14 +468,21 @@ void pio_usb_device_task(void) {
  
        // TODO should be reset end, this is reset start only
        rport->ep_complete = rport->ep_stalled = rport->ep_error = 0;
@@ -573,7 +584,29 @@ index 5057152..6c0cecf 100644
    }
  }
  
-@@ -503,9 +548,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
+@@ -456,8 +503,12 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
+ 
+   if (packet->request_type == USB_REQ_DIR_IN) {
+     if (packet->request == 0x06) {
++      // Send at most wLength bytes. A BIOS asks for the first 8 bytes of the
++      // device descriptor; all 18 in one packet is babble to it, and it
++      // retried and reset the port until it gave up on the device.
++      uint16_t const req_len = packet->length_lsb | (packet->length_msb << 8);
+       if (packet->value_msb == DESC_TYPE_DEVICE) {
+-        prepare_ep0_data((uint8_t *)descriptor_buffers.device, 18);
++        prepare_ep0_data((uint8_t *)descriptor_buffers.device, req_len < 18 ? req_len : 18);
+         res = 0;
+       } else if (packet->value_msb == DESC_TYPE_CONFIG) {
+         ep0_desc_request_len = (packet->length_lsb | (packet->length_msb << 8));
+@@ -466,6 +517,7 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
+       } else if (packet->value_msb == DESC_TYPE_STRING) {
+         if (descriptor_buffers.string != NULL) {
+           ep0_desc_request_idx = packet->value_lsb;
++          ep0_desc_request_len = req_len;
+           ep0_desc_request_type = DESC_TYPE_STRING;
+           res = 0;
+         }
+@@ -503,9 +555,26 @@ static int __no_inline_not_in_flash_func(process_device_setup_stage)(uint8_t *bu
        res = 0;
      } else if (packet->request == 0x0B) {
        // set hid protocol request
@@ -600,7 +633,20 @@ index 5057152..6c0cecf 100644
    } else if (packet->request_type == (USB_REQ_REC_EP)) {
        prepare_ep0_data(NULL, 0);
        res = 0;
-@@ -562,7 +624,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+@@ -529,7 +598,11 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+   }
+ 
+   if (ints & PIO_USB_INTS_SETUP_REQ_BITS) {
+-    process_device_setup_stage(root->setup_packet);
++    // A request we do not handle gets STALL (cleared by the next SETUP);
++    // without a reply the host waits for its timeout.
++    if (process_device_setup_stage(root->setup_packet) < 0) {
++      PIO_USB_ENDPOINT(0)->stalled = PIO_USB_ENDPOINT(1)->stalled = true;
++    }
+     dev->control_pipe.stage = STAGE_DATA;
+   }
+ 
+@@ -562,7 +635,12 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
        if (root->ep_continue & (1 << b)) {
          endpoint_t *ep = PIO_USB_ENDPOINT((b << 1) | 0x01);
          uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
