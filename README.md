@@ -288,8 +288,9 @@ test network.
 
 ## Known limitations
 
-- Tested on one board only; the RP2350 firmware has not been run on
-  hardware yet.
+- Tested on one board only. The RP2350 CDC firmware has been run on
+  hardware (loopback, and one PC in its OS and BIOS menu); the UART
+  firmware has not.
 - With the C790 on RK3288 the ISP's MI_CTRL register resets itself a few
   times a minute; the patched rkisp1 driver restores it and drops one
   frame each time.

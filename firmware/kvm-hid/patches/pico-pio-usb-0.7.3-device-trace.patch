@@ -1,0 +1,116 @@
+diff --git a/src/pio_usb.h b/src/pio_usb.h
+index 353a867..4c4d43f 100644
+--- a/src/pio_usb.h
++++ b/src/pio_usb.h
+@@ -30,6 +30,24 @@ endpoint_t *pio_usb_get_endpoint(usb_device_t *device, uint8_t idx);
+ // device mode: HID protocol per interface (0 boot, 1 report), see SET_PROTOCOL
+ #define PIO_USB_DEVICE_HID_ITF_MAX 8
+ extern volatile uint8_t pio_usb_device_hid_protocol[PIO_USB_DEVICE_HID_ITF_MAX];
++
++// device mode: trace of bus events for diagnostics. Written by the core
++// running pio_usb_device_task(); entry i is valid once trace_head > i (the
++// ring keeps the last PIO_USB_DEVICE_TRACE_LEN).
++#define PIO_USB_DEVICE_TRACE_LEN 64
++#define PIO_USB_DEVICE_EP_MAX 4
++typedef struct {
++  uint32_t time_us;
++  char kind;        // 'R' bus reset, 'A' address in use, 'S' SETUP packet
++  int8_t res;       // 'S': 0 answered, -1 not handled (no reply: host times out)
++  uint8_t data[8];  // 'S': the SETUP packet, 'A': the address
++} pio_usb_device_trace_t;
++extern pio_usb_device_trace_t pio_usb_device_trace[PIO_USB_DEVICE_TRACE_LEN];
++extern volatile uint32_t pio_usb_device_trace_head;
++extern volatile uint32_t pio_usb_device_sof_count;
++// per endpoint number: IN tokens seen, data packets the host ACKed
++extern volatile uint32_t pio_usb_device_in_tokens[PIO_USB_DEVICE_EP_MAX];
++extern volatile uint32_t pio_usb_device_in_acked[PIO_USB_DEVICE_EP_MAX];
+ int pio_usb_get_in_data(endpoint_t *ep, uint8_t *buffer, uint8_t len);
+ int pio_usb_set_out_data(endpoint_t *ep, const uint8_t *buffer, uint8_t len);
+ 
+diff --git a/src/pio_usb_device.c b/src/pio_usb_device.c
+index 4fa20c6..321a2a1 100644
+--- a/src/pio_usb_device.c
++++ b/src/pio_usb_device.c
+@@ -32,6 +32,26 @@ static uint8_t new_devaddr = 0;
+ // HID protocol per interface as set by SET_PROTOCOL (0 boot, 1 report; 1
+ // after reset), so the application can send boot reports to a BIOS.
+ volatile uint8_t pio_usb_device_hid_protocol[PIO_USB_DEVICE_HID_ITF_MAX];
++pio_usb_device_trace_t pio_usb_device_trace[PIO_USB_DEVICE_TRACE_LEN];
++volatile uint32_t pio_usb_device_trace_head;
++volatile uint32_t pio_usb_device_sof_count;
++volatile uint32_t pio_usb_device_in_tokens[PIO_USB_DEVICE_EP_MAX];
++volatile uint32_t pio_usb_device_in_acked[PIO_USB_DEVICE_EP_MAX];
++
++static void __no_inline_not_in_flash_func(trace_add)(char kind, int8_t res,
++                                                      const uint8_t *data, uint len) {
++  uint32_t head = pio_usb_device_trace_head;
++  pio_usb_device_trace_t *t = &pio_usb_device_trace[head % PIO_USB_DEVICE_TRACE_LEN];
++  t->time_us = get_time_us_32();
++  t->kind = kind;
++  t->res = res;
++  memset(t->data, 0, sizeof(t->data));
++  if (data) {
++    memcpy(t->data, data, len < sizeof(t->data) ? len : sizeof(t->data));
++  }
++  __dmb();
++  pio_usb_device_trace_head = head + 1;
++}
+ static uint8_t ep0_crc5_lut[16];
+ static __unused usb_descriptor_buffers_t descriptor_buffers;
+ 
+@@ -143,6 +163,9 @@ static void __no_inline_not_in_flash_func(device_in)(pio_port_t *pp, root_port_t
+                                                       int ep_num) {
+   endpoint_t *ep = PIO_USB_ENDPOINT((ep_num << 1) | 0x01);
+   bool const has_transfer = ep->has_transfer;
++  if (ep_num < PIO_USB_DEVICE_EP_MAX) {
++    pio_usb_device_in_tokens[ep_num]++;
++  }
+   if (has_transfer) {
+     tx_packet(pp, ep->buffer, ep->encoded_data_len);
+   } else if (ep->stalled) {
+@@ -160,11 +183,15 @@ static void __no_inline_not_in_flash_func(device_in)(pio_port_t *pp, root_port_t
+   if (rx_packet(pp, &crc_ok) != 2 || rx_buf[1] != USB_PID_ACK) {
+     return;
+   }
++  if (ep_num < PIO_USB_DEVICE_EP_MAX) {
++    pio_usb_device_in_acked[ep_num]++;
++  }
+ 
+   if (ep->ep_num == 0x80 && new_devaddr > 0) {
+     rport->dev_addr = new_devaddr;
+     new_devaddr = 0;
+     update_ep0_crc5_lut(rport->dev_addr);
++    trace_add('A', 0, &rport->dev_addr, 1);
+   }
+ 
+   // The next packet is encoded later by pio_usb_device_task(). Until then
+@@ -240,6 +267,10 @@ static void __no_inline_not_in_flash_func(usb_device_packet_handler)(void) {
+       continue; // not a token (or lost): nothing to answer
+     }
+     uint8_t const pid = rx_buf[1];
++    if (pid == USB_PID_SOF) {
++      pio_usb_device_sof_count++;
++      continue;
++    }
+     if (pid != USB_PID_IN && pid != USB_PID_OUT && pid != USB_PID_SETUP) {
+       continue;
+     }
+@@ -479,6 +510,7 @@ void pio_usb_device_task(void) {
+       memset((void *)pio_usb_device_hid_protocol, 1, sizeof(pio_usb_device_hid_protocol));
+       rport->ints |= PIO_USB_INTS_RESET_END_BITS;
+       reset = true;
++      trace_add('R', 0, NULL, 0);
+     }
+   }
+   if (reset) {
+@@ -600,7 +632,9 @@ static void __no_inline_not_in_flash_func(__pio_usb_device_irq_handler)(uint8_t
+   if (ints & PIO_USB_INTS_SETUP_REQ_BITS) {
+     // A request we do not handle gets STALL (cleared by the next SETUP);
+     // without a reply the host waits for its timeout.
+-    if (process_device_setup_stage(root->setup_packet) < 0) {
++    int8_t res = (int8_t)process_device_setup_stage(root->setup_packet);
++    trace_add('S', res, root->setup_packet, 8);
++    if (res < 0) {
+       PIO_USB_ENDPOINT(0)->stalled = PIO_USB_ENDPOINT(1)->stalled = true;
+     }
+     dev->control_pipe.stage = STAGE_DATA;

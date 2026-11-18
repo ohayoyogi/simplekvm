@@ -182,6 +182,109 @@ static void pump_hid(void) {
   }
 }
 
+// ---- USB trace (diagnostics) -----------------------------------------------
+// What the target's host does on the USB-A port, as "T ..." lines on the CDC
+// link (kvm.py logs them), e.g. to see how far a BIOS gets:
+//   T <ms> R                     bus reset
+//   T <ms> A <addr>              the new address is in use
+//   T <ms> S <bmRequestType> <bRequest> <wValue> <wIndex> <wLength> ok|no
+//                                SETUP packet (no = not handled: no reply)
+//   T <ms> P sof=<n> in=<k>,<a>,<r> ack=<k>,<a>,<r>
+//                                when the bus activity changes (checked every
+//                                500 ms): SOFs, IN tokens and ACKed reports
+//                                per endpoint (keyboard, abs/rel mouse) in
+//                                the last 500 ms
+//   T <ms> X <n>                 n entries were lost
+// Entries wait in Pico-PIO-USB's ring (the last 64) while the link is closed.
+// When DTR goes up (kvm.py opens the port) the whole ring is sent again, as
+// what went out while nobody had the port open was dropped by the host.
+
+#define TRACE_LEN PIO_USB_DEVICE_TRACE_LEN
+#define TRACE_PERIOD_MS 500
+
+static uint32_t trace_read;
+static volatile bool trace_replay;
+
+static bool trace_line(const char *s) {
+  uint32_t len = (uint32_t)strlen(s);
+  if (tud_cdc_write_available() < len) return false;   // send it next time
+  tud_cdc_write(s, len);
+  return true;
+}
+
+static bool trace_entries(void) {
+  char line[64];
+  uint32_t head = pio_usb_device_trace_head;
+  __dmb();
+  if (head - trace_read > TRACE_LEN) {
+    snprintf(line, sizeof line, "T %lu X %lu\n", (unsigned long)now_ms(),
+             (unsigned long)(head - trace_read - TRACE_LEN));
+    if (!trace_line(line)) return false;
+    trace_read = head - TRACE_LEN;
+  }
+  for (; trace_read != head; trace_read++) {
+    pio_usb_device_trace_t t = pio_usb_device_trace[trace_read % TRACE_LEN];
+    unsigned long ms = (unsigned long)(t.time_us / 1000);
+    const uint8_t *d = t.data;
+    if (t.kind == 'S') {
+      snprintf(line, sizeof line, "T %lu S %02x %02x %04x %04x %04x %s\n", ms, d[0], d[1],
+               d[2] | d[3] << 8, d[4] | d[5] << 8, d[6] | d[7] << 8, t.res < 0 ? "no" : "ok");
+    } else if (t.kind == 'A') {
+      snprintf(line, sizeof line, "T %lu A %u\n", ms, d[0]);
+    } else {
+      snprintf(line, sizeof line, "T %lu %c\n", ms, t.kind);
+    }
+    if (!trace_line(line)) return false;
+  }
+  return true;
+}
+
+static void trace_activity(void) {
+  static uint32_t last_ms, last_sof, last_tok[PIO_USB_DEVICE_EP_MAX], last_ack[PIO_USB_DEVICE_EP_MAX];
+  static uint8_t last_state = 0xff;
+  if (trace_replay) {
+    trace_replay = false;
+    last_state = 0xff;   // report the current activity too
+  }
+  uint32_t now = now_ms();
+  if (now - last_ms < TRACE_PERIOD_MS) return;
+  last_ms = now;
+  uint32_t sof = pio_usb_device_sof_count, tok[PIO_USB_DEVICE_EP_MAX], ack[PIO_USB_DEVICE_EP_MAX];
+  uint8_t state = sof != last_sof;
+  for (int i = 1; i < PIO_USB_DEVICE_EP_MAX; i++) {
+    tok[i] = pio_usb_device_in_tokens[i] - last_tok[i];
+    ack[i] = pio_usb_device_in_acked[i] - last_ack[i];
+    last_tok[i] += tok[i];
+    last_ack[i] += ack[i];
+    state |= (uint8_t)((tok[i] != 0) << i);
+  }
+  uint32_t nsof = sof - last_sof;
+  last_sof = sof;
+  // only changes of what is active (SOF, polled endpoints), not every count
+  if (state == last_state) return;
+  char line[96];
+  snprintf(line, sizeof line, "T %lu P sof=%lu in=%lu,%lu,%lu ack=%lu,%lu,%lu\n",
+           (unsigned long)now, (unsigned long)nsof, (unsigned long)tok[1],
+           (unsigned long)tok[2], (unsigned long)tok[3], (unsigned long)ack[1],
+           (unsigned long)ack[2], (unsigned long)ack[3]);
+  if (trace_line(line)) last_state = state;
+}
+
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
+  (void)itf;
+  (void)rts;
+  if (!dtr) return;
+  uint32_t head = pio_usb_device_trace_head;
+  trace_read = head > TRACE_LEN ? head - TRACE_LEN : 0;
+  trace_replay = true;
+}
+
+static void trace_task(void) {
+  if (!tud_cdc_connected()) return;
+  if (trace_entries()) trace_activity();
+  tud_cdc_write_flush();
+}
+
 // ---- CDC link to the KVM host (native USB-C) ------------------------------
 
 const char *bridge_variant(void) { return "cdc"; }
@@ -226,6 +329,7 @@ int main(void) {
       for (uint32_t i = 0; i < n; i++) proto_feed(&proto, (char)buf[i]);
     }
     pump_hid();
+    trace_task();
     led_task(tud_cdc_connected(), pio_dev != NULL, false, bridge_activity_ms);
   }
 }

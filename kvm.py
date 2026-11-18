@@ -288,6 +288,39 @@ class FbEcho:
 #   Z                        release everything
 #   ?                        identify -> "OK kvm-hid <variant> <version>"
 # From the RP2350:  "L xx" keyboard LEDs (bit0 Num, bit1 Caps, bit2 Scroll)
+#                   "T ..." USB trace of the target's host (CDC firmware only,
+#                   see firmware/kvm-hid/src/cdc/main.c), logged as "hid usb:"
+
+USB_REQUESTS = {
+    (0x80, 0): "GET_STATUS", (0x00, 1): "CLEAR_FEATURE", (0x00, 3): "SET_FEATURE",
+    (0x00, 5): "SET_ADDRESS", (0x80, 6): "GET_DESCRIPTOR", (0x80, 8): "GET_CONFIGURATION",
+    (0x00, 9): "SET_CONFIGURATION", (0x81, 0): "GET_STATUS(itf)", (0x81, 6): "GET_DESCRIPTOR(itf)",
+    (0x81, 10): "GET_INTERFACE", (0x01, 11): "SET_INTERFACE", (0x82, 0): "GET_STATUS(ep)",
+    (0x02, 1): "CLEAR_FEATURE(ep)", (0xa1, 1): "GET_REPORT", (0xa1, 2): "GET_IDLE",
+    (0xa1, 3): "GET_PROTOCOL", (0x21, 9): "SET_REPORT", (0x21, 10): "SET_IDLE",
+    (0x21, 11): "SET_PROTOCOL",
+}
+USB_DESCRIPTORS = {1: "device", 2: "config", 3: "string", 6: "qualifier", 0x21: "hid",
+                   0x22: "report"}
+
+
+def usb_trace_text(s):
+    """Spell out a "T <ms> S ..." SETUP line from the firmware's USB trace."""
+    f = s.split()
+    if len(f) != 8 or f[1] != "S":
+        return s
+    try:
+        rt, req, val, idx, ln = (int(x, 16) for x in f[2:7])
+    except ValueError:
+        return s
+    name = USB_REQUESTS.get((rt, req), "%02x/%02x" % (rt, req))
+    if req == 6 and rt in (0x80, 0x81):
+        name += " %s#%d" % (USB_DESCRIPTORS.get(val >> 8, "%02x" % (val >> 8)), val & 0xff)
+    elif rt & 0x60 == 0x20:                 # HID class: wValue = report type/ID, idle, protocol
+        name += " value=%04x" % val
+    else:
+        name += " value=%d" % val
+    return "%s %s index=%d len=%d %s" % (f[0], name, idx, ln, f[7])
 
 # KeyboardEvent.code (physical key) -> HID usage (Keyboard/Keypad page)
 HID_KEYS = {}
@@ -512,6 +545,18 @@ class HidSerial(Hid):
         attr[2] &= ~termios.HUPCL
         termios.tcsetattr(fd, termios.TCSANOW, attr)
         termios.tcflush(fd, termios.TCIOFLUSH)
+        # DTR stays up after a close (no HUPCL), so drop and raise it: the
+        # CDC firmware then sends its USB trace again from the start of its
+        # buffer (anything sent while the port was closed was discarded)
+        try:
+            import fcntl
+            import struct
+            dtr = struct.pack("I", termios.TIOCM_DTR)
+            fcntl.ioctl(fd, termios.TIOCMBIC, dtr)
+            time.sleep(0.05)
+            fcntl.ioctl(fd, termios.TIOCMBIS, dtr)
+        except OSError:
+            pass                     # e.g. a UART without modem lines
         return fd
 
     def _ensure(self):
@@ -591,6 +636,8 @@ class HidSerial(Hid):
                         self._set_leds(int(line[2:4], 16))
                     except ValueError:
                         continue
+                elif line.startswith("T "):
+                    log("hid usb:", usb_trace_text(line[2:]))
 
 
 class HidGadget(Hid):
