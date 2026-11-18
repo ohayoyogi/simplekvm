@@ -1335,6 +1335,7 @@ class KVM:
         self.encoder = Encoder(args, self.on_au, csi)
         self.encoder.on_size = self.on_size
         self.idle_timer = None
+        self.signal_ok = True             # HDMI input (csi only); sent in hello
         self.stats = collections.deque(maxlen=self.args.fps * 2)
 
     # input -----------------------------------------------------------------
@@ -1410,11 +1411,13 @@ class KVM:
             if cur is None:
                 if not lost:
                     lost = True
+                    self.signal_ok = False
                     log("csi: HDMI signal lost")
                     self.broadcast({"t": "signal", "ok": False})
                 continue
             if lost:
                 lost = False
+                self.signal_ok = True
                 log("csi: HDMI signal %dx%d" % cur)
                 self.broadcast({"t": "signal", "ok": True})
                 if cur == csi.src and time.monotonic() - self.encoder.last_au > 2:
@@ -1521,7 +1524,7 @@ class KVM:
         c.send(json.dumps({"t": "hello", "source": self.args.source,
                            "w": self.args.width, "h": self.args.height,
                            "sensor": self.csi.sensor if self.csi else "",
-                           "fbEcho": bool(self.fb),
+                           "fbEcho": bool(self.fb), "signal": self.signal_ok,
                            "hid": self.hid.status() if self.hid else None}).encode(), opcode=1)
 
     def remove_client(self, c):
@@ -1566,7 +1569,13 @@ PAGE = r"""<!doctype html>
   #wrap:fullscreen { background: #000; align-items: center; justify-content: center; padding: 0; }
   #wrap:fullscreen canvas { max-width: 100vw; max-height: 100vh; width: auto; height: auto; outline: none; }
   canvas:focus { outline-width: 2px; }
-  #wrap { display: flex; justify-content: center; padding: 8px; }
+  #wrap { display: flex; justify-content: center; padding: 8px; position: relative; }
+  /* video stopped: dim the frozen last frame and say why */
+  #stale { position: absolute; top: 24px; left: 50%; transform: translateX(-50%);
+           background: rgba(160, 30, 30, .9); color: #fff; padding: 6px 14px;
+           border-radius: 6px; font-weight: 600; pointer-events: none; white-space: nowrap; }
+  #stale[hidden] { display: none; }
+  canvas.stale { filter: grayscale(1) brightness(.5); }
   canvas { background: #000; cursor: crosshair; outline: 1px solid #333; }
   /* fit: scale down to the window; 1:1: one video pixel per device pixel */
   #wrap.fit canvas { max-width: 100%; height: auto; image-rendering: auto; }
@@ -1601,7 +1610,7 @@ PAGE = r"""<!doctype html>
     <option value="jis">JIS</option><option value="us">US</option></select>
   <button id="rall" type="button" title="押しっぱなしになったキーを離す">全部離す</button>
 </div>
-<div id="wrap" class="fit"><canvas id="c" width="__W__" height="__H__"></canvas></div>
+<div id="wrap" class="fit"><canvas id="c" width="__W__" height="__H__"></canvas><div id="stale" hidden></div></div>
 <script>
 let W = __W__, H = __H__;            // stream size; changes with the HDMI mode
 const FPS = __FPS__;
@@ -1628,6 +1637,23 @@ const pending = new Map();          // input seq -> click time
 const frameSeq = new Map();         // frame no -> applied input seq
 let lats = [], rx = [], encMs = [];
 let source = 'screen';
+// Stop indicator: no decoded frame for STALE_MS, a lost HDMI signal, or a
+// closed socket. The canvas keeps the last frame, so without this a frozen
+// picture looks live.
+const STALE_MS = 1500;
+let lastFrame = 0, signalOk = true, wsOpen = false;
+function updateStale() {
+  const age = lastFrame ? performance.now() - lastFrame : Infinity;
+  let msg = '';
+  if (!wsOpen) msg = '映像停止: 切断中（再接続します）';
+  else if (!signalOk) msg = '映像停止: HDMI 信号なし';
+  else if (age > STALE_MS) msg = lastFrame ? '映像停止: フレームが届いていません' : '映像待ち';
+  if (msg && lastFrame) msg += '（' + Math.floor(age / 1000) + ' 秒前の画面）';
+  const el = $('stale');
+  el.hidden = !msg;
+  el.textContent = msg;
+  cv.classList.toggle('stale', !!msg && !!lastFrame);
+}
 // Capture mode has no frame <-> input link, so watch the clicked pixel:
 // the server's fb echo paints a square there on the board's HDMI output.
 const probes = [];
@@ -1663,6 +1689,7 @@ function newDecoder() {
   dec = new VideoDecoder({
     output: f => {
       ctx.drawImage(f, 0, 0, W, H);
+      lastFrame = performance.now();
       const no = Math.round(f.timestamp * FPS / 1e6);
       f.close();
       $('fno').textContent = no;
@@ -1702,7 +1729,8 @@ function onVideo(buf) {
 function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { $('st').textContent = '接続（キーフレーム待ち）'; configured = false; };
+  ws.onopen = () => { $('st').textContent = '接続（キーフレーム待ち）'; configured = false;
+                      wsOpen = true; updateStale(); };
   ws.onmessage = e => {
     if (typeof e.data !== 'string') return onVideo(e.data);
     const m = JSON.parse(e.data);
@@ -1710,10 +1738,13 @@ function connect() {
     if (m.t === 'size') return setSize(m.w, m.h);
     if (m.t === 'signal') {
       $('st').textContent = m.ok ? '信号あり（キーフレーム待ち）' : 'HDMI 信号なし';
+      signalOk = m.ok; updateStale();
       return;
     }
     if (m.t === 'hello') {
       setSize(m.w, m.h);
+      signalOk = m.signal !== false; updateStale();
+      if (!signalOk) $('st').textContent = 'HDMI 信号なし';
       onHid(m.hid);
       source = m.source;
       const echo = m.fbEcho ? '（クリックを HDMI に描画）' : '';
@@ -1721,7 +1752,8 @@ function connect() {
         : m.source === 'csi' ? 'CSI（' + m.sensor + '）' + echo : '画面バッファ';
     }
   };
-  ws.onclose = () => { $('st').textContent = '切断（再接続します）'; setTimeout(connect, 1000); };
+  ws.onclose = () => { $('st').textContent = '切断（再接続します）'; wsOpen = false;
+                       updateStale(); setTimeout(connect, 1000); };
 }
 
 // New stream size (HDMI mode change, or a page cached from before one):
@@ -1909,6 +1941,7 @@ setInterval(() => {
   $('fps').textContent = (rx.length / 2).toFixed(1);
   $('kbps').textContent = (rx.reduce((a, [, n]) => a + n, 0) * 8 / 2 / 1000).toFixed(0);
   if (encMs.length) $('enc').textContent = (encMs.reduce((a, b) => a + b, 0) / encMs.length).toFixed(0);
+  updateStale();
 }, 500);
 
 if (!('VideoDecoder' in window)) {
