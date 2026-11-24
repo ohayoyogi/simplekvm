@@ -537,14 +537,18 @@ class HidSerial(Hid):
         import termios
         import tty
         fd = os.open(self.path, os.O_RDWR | os.O_NOCTTY)
-        tty.setraw(fd)
-        attr = termios.tcgetattr(fd)
-        speed = getattr(termios, "B%d" % self.baud)
-        attr[4] = attr[5] = speed
-        attr[2] |= termios.CLOCAL | termios.CREAD
-        attr[2] &= ~termios.HUPCL
-        termios.tcsetattr(fd, termios.TCSANOW, attr)
-        termios.tcflush(fd, termios.TCIOFLUSH)
+        try:
+            tty.setraw(fd)
+            attr = termios.tcgetattr(fd)
+            speed = getattr(termios, "B%d" % self.baud)
+            attr[4] = attr[5] = speed
+            attr[2] |= termios.CLOCAL | termios.CREAD
+            attr[2] &= ~termios.HUPCL
+            termios.tcsetattr(fd, termios.TCSANOW, attr)
+            termios.tcflush(fd, termios.TCIOFLUSH)
+        except termios.error as e:   # gone again already; not an OSError
+            os.close(fd)
+            raise OSError(*e.args)
         # DTR stays up after a close (no HUPCL), so drop and raise it: the
         # CDC firmware then sends its USB trace again from the start of its
         # buffer (anything sent while the port was closed was discarded)
@@ -620,8 +624,11 @@ class HidSerial(Hid):
                     if self.fd == fd:
                         self._drop(e)
                 continue
-            if not chunk:
-                time.sleep(0.05)
+            if not chunk:            # raw tty (VMIN=1): hung up, e.g. CDC unplug
+                with self.lock:
+                    if self.fd == fd:
+                        self._drop("hung up")    # _writer opens it again
+                buf = b""
                 continue
             buf += chunk
             while b"\n" in buf:
